@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: {{ .Release.Name }}}
+  template:
+    metadata:
+      labels: {app: {{ .Release.Name }}}
+    spec:
+      containers:
+        - name: vllm
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --model={{ .Values.model }}
+            - --tensor-parallel-size={{ .Values.gpus }}
+            - --enable-expert-parallel
+            - --trust-remote-code
+{{- range .Values.extraArgs }}
+            - {{ . | quote }}
+{{- end }}
+          env:
+            - name: PAR_KEEP
+              value: {{ .Values.keep | quote }}
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.hfTokenSecret }}, key: HF_TOKEN}
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              {{- toYaml .Values.resources.limits | nindent 14 }}
+              nvidia.com/gpu: {{ .Values.gpus }}
+            requests:
+              {{- toYaml .Values.resources.requests | nindent 14 }}
+              nvidia.com/gpu: {{ .Values.gpus }}
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            failureThreshold: 60
+          volumeMounts:
+            - {name: shm, mountPath: /dev/shm}
+      volumes:
+        # The all-to-all runs over NCCL shared memory; the 64 MB default makes EP crawl.
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 16Gi}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}

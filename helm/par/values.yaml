@@ -1,0 +1,34 @@
+image:
+  repository: ghcr.io/almogtavor/par-vllm
+  tag: v0.31.0
+  pullPolicy: IfNotPresent
+
+model: Qwen/Qwen3-30B-A3B
+
+# How many of the top-k picks are chosen by score. The rest are re-placed onto ranks the head
+# already forces a visit to. Empty string is stock vLLM routing, which is the arm every claim
+# about this chart has to be compared against.
+keep: "2"
+
+# Expert parallelism is the whole point: the rule shrinks the all-to-all, so without
+# `--enable-expert-parallel` there is nothing to shrink. GPUs must equal the EP size, and the
+# model's expert count must divide by it.
+gpus: 4
+
+extraArgs: []
+
+hfTokenSecret: llm-d-hf-token
+
+resources:
+  limits:
+    cpu: "16"
+    memory: 200Gi
+  requests:
+    cpu: "8"
+    memory: 100Gi
+
+service:
+  port: 8000
+
+nodeSelector: {}
+tolerations: []

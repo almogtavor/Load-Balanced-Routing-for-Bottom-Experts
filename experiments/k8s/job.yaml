@@ -1,0 +1,108 @@
+# One Job per model: both phases, four GPUs, one container. Substitute and apply through
+# `launch.sh`, which is the only intended entrypoint.
+#
+# Only the four BF16 checkpoints this experiment uses are mounted. `/results` carries the
+# cached token streams in and the `runs/` artefacts out, so the figure can be drawn from a
+# laptop after the four jobs have finished.
+#
+# TF4=1 builds a transformers-4.x venv with uv, inheriting the image's torch. Hunyuan-A13B
+# needs it: its vendored `hunyuan.py` imports `is_torch_fx_available`, which transformers 5.x
+# removed. The Qwen models run on the image's own transformers. The vLLM arms (`ARMS`) do not
+# use it - vLLM 0.31 serves Hunyuan through the Transformers backend, which runs that same
+# vendored file inside each worker, so the missing symbol is shimmed in `par.plugin` instead.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: par-${NAME}
+  namespace: llm-d-pic
+  labels: {app: par, owner: almogtavor}
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels: {app: par, owner: almogtavor}
+    spec:
+      restartPolicy: Never
+      # Optional `NODE=<hostname>` pin. The packing scheduler is deterministic, so a node whose
+      # GPU has fallen off the bus keeps being chosen and every retry fails the same way; the
+      # pin is the escape hatch. Empty renders as `{}`, which means "anywhere".
+      nodeSelector: {${NODE}}
+      containers:
+      - name: run
+        image: vllm/vllm-openai:${IMG}
+        command: [/bin/bash, -lc]
+        args:
+        - |
+          set -xeuo pipefail
+          cd /results/par
+          export PY=python3
+          if [ "${TF4}" = "1" ]; then
+            pip -q install --no-cache-dir uv
+            uv venv --system-site-packages --python "$(which python3)" /tmp/venv
+            # --no-deps is load-bearing: resolving normally pulls a second torch into the
+            # venv, which shadows the image's and leaves the image's torchvision built
+            # against a torch that is no longer the one being imported. Only transformers
+            # changes version; everything under it comes from the image.
+            uv pip install --python /tmp/venv/bin/python -q --no-deps \
+               "transformers==${TFVER}" "huggingface-hub>=0.34,<1.0"
+            # The accepted tokenizers range differs by transformers minor and the check is a
+            # hard ImportError, not a warning. Reading it out of the installed metadata keeps
+            # TFVER the only knob; a literal range here rots the next time TFVER moves.
+            TOK=$(/tmp/venv/bin/python -c 'import importlib.metadata as md; print(next(r.split(";")[0].strip() for r in md.requires("transformers") if r.startswith("tokenizers") and "extra" not in r))')
+            uv pip install --python /tmp/venv/bin/python -q --no-deps "${TOK}"
+            export PY=/tmp/venv/bin/python
+          fi
+          # Through bash rather than by the shebang: the PVC does not always carry the
+          # execute bit across a sync.
+          exec bash experiments/run.sh
+        env:
+        # OpenShift runs with a uid absent from /etc/passwd; torch's cache-dir lookup calls
+        # getpass.getuser() and dies without these.
+        - {name: USER, value: vllm}
+        - {name: LOGNAME, value: vllm}
+        - {name: HOME, value: /tmp}
+        - {name: HF_HOME, value: /tmp/hf}
+        - {name: XDG_CACHE_HOME, value: /tmp/.cache}
+        - {name: TRITON_CACHE_DIR, value: /tmp/triton}
+        # The image ships a root-owned /opt/uv/cache, which the assigned uid cannot write.
+        - {name: UV_CACHE_DIR, value: /tmp/uv-cache}
+        - {name: VLLM_CACHE_ROOT, value: /tmp/vllm}
+        - {name: TF4, value: "${TF4}"}
+        # Non-empty switches run.sh to the vLLM path: one engine per listed arm, in order.
+        - {name: ARMS, value: "${ARMS}"}
+        - {name: TFVER, value: "${TFVER}"}
+        - {name: MODEL, value: "${MODEL}"}
+        - {name: TAG, value: "${TAG}"}
+        - {name: GPUS, value: "${GPUS}"}
+        # Hunyuan dispatches through a dense [tokens, experts, capacity] mask, and this
+        # experiment raises capacity to the true maximum load, so that model scores one
+        # sequence at a time.
+        - {name: BATCH, value: "${BATCH}"}
+        - {name: NWIN, value: "${NWIN}"}
+        - {name: KEEPS, value: "${KEEPS}"}
+        - {name: STREAM, value: "${STREAM}"}
+        - {name: TOKREF, value: "${TOKREF}"}
+        # bench.py pulls GPQA's rows from the Hub; the mirror is ungated but an anonymous
+        # pull is rate-limited and four jobs start at once.
+        - name: HF_TOKEN
+          valueFrom: {secretKeyRef: {name: llm-d-hf-token, key: HF_TOKEN}}
+        resources:
+          limits: {cpu: "32", memory: ${MEM}, nvidia.com/gpu: "${GPUS}"}
+          requests: {cpu: "8", memory: ${MEM}, nvidia.com/gpu: "${GPUS}"}
+        volumeMounts:
+        - {mountPath: /models/qwen_tok, name: q30rh-bf16, readOnly: true}
+        - {mountPath: /models/bf16, name: q30rh-bf16, readOnly: true}
+        - {mountPath: /models/q35_bf16, name: q35-bf16, readOnly: true}
+        - {mountPath: /models/hy_bf16, name: hy-bf16, readOnly: true}
+        - {mountPath: /models/gm_bf16, name: gm-bf16, readOnly: true}
+        - {mountPath: /results, name: results}
+        - {mountPath: /dev/shm, name: dshm}
+      volumes:
+      - {name: q30rh-bf16, persistentVolumeClaim: {claimName: model-qwen-qwen3-30b-a3b-instruct-2507-rwx}}
+      - {name: q35-bf16, persistentVolumeClaim: {claimName: model-qwen-qwen35-35b-a3b-bf16-rwx}}
+      - {name: hy-bf16, persistentVolumeClaim: {claimName: model-tencent-hunyuan-a13b-instruct-rwx}}
+      - {name: gm-bf16, persistentVolumeClaim: {claimName: model-gemma-4-26b-a4b-it-rwx}}
+      # The claim the `results-rw` pod mounts, which is the one `oc cp` syncs the code to.
+      - {name: results, persistentVolumeClaim: {claimName: kvcache-bench-results-almogtavor}}
+      # NCCL's intra-node transports need shared memory well beyond the default 64 MB.
+      - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}

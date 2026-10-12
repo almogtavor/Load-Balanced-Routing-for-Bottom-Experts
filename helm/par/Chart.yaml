@@ -1,0 +1,6 @@
+apiVersion: v2
+name: par
+description: vLLM with the placement-aware MoE router
+type: application
+version: 0.1.0
+appVersion: "0.31.0"
