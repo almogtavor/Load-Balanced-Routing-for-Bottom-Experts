@@ -206,6 +206,20 @@ def rewrite(logits: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Te
     return ids, gate_weights(logits, ids, renormalize=True)
 
 
+def unroutable(topk_ids: torch.Tensor, e: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """`([T, 1]` mask of rows that are not a selection, ids clamped into `[0, e)`).
+
+    A caller that has to index an `[T, E]` tensor with these ids needs both: vLLM hands over
+    padded rows (see the kernel's pass-through branch) and the kernel returns them untouched,
+    so the ids can be anything at all. The test is "outside the expert range" rather than
+    "negative", because `topk_indices_dtype` is unsigned on some backends and vLLM's own -1
+    padding sentinel arrives there as 4294967295 - which is non-negative and still walks a
+    `scatter_` off the end of the row.
+    """
+    ids = topk_ids.long()
+    return ((ids < 0) | (ids >= e)).any(1, keepdim=True), ids.clamp(0, e - 1)
+
+
 def gate_weights(logits: torch.Tensor, topk_ids: torch.Tensor,
                  renormalize: bool) -> torch.Tensor:
     """The gate weights the router would have given these experts.
@@ -295,6 +309,13 @@ def _check() -> None:
         assert torch.equal(got[:3], bad[:3]), "declined rows must pass through unchanged"
         assert torch.allclose(gw[:3], win[:3]), "declined rows keep their own weights"
         assert got[3].sort().values.diff().min() > 0, "a sound row in the batch still rewrites"
+        # Gemma's path indexes `[T, E]` tensors with whatever came back, so it needs every
+        # declined row flagged - including under an unsigned index dtype, where -1 is a large
+        # positive number and a `< 0` test reads a padded row as a real expert.
+        for ids in (got, got.to(torch.uint32)):
+            miss, safe = unroutable(ids, E)
+            assert bool(miss[:3].all()) and not bool(miss[3]), "declined rows must be flagged"
+            assert int(safe.min()) >= 0 and int(safe.max()) < E, "clamped into range"
         # Not "the row changed" - that is only true with high probability. The rule itself is
         # exact: every expert the rewritten row visits lives on a rank its top-`keep` already
         # forced a visit to, so the row's rank set *is* its head's rank set.
