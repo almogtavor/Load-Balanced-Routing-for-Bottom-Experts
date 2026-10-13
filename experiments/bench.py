@@ -51,13 +51,11 @@ import urllib.parse
 import urllib.request
 
 import numpy as np
-import torch
-from transformers import AutoTokenizer
 
-import moe
-
-MODEL = os.environ["MODEL"]
-TAG = os.environ["TAG"]
+# torch, transformers and `moe` are imported where they are used, not here: `compare.py` wants
+# `mcnemar` and nothing else, and it draws the figure from a laptop that has none of them.
+MODEL = os.environ.get("MODEL", "")
+TAG = os.environ.get("TAG", "")
 N_GPUS = int(os.environ.get("GPUS", 4))
 KEEPS = tuple(int(x) for x in os.environ.get("KEEPS", "6,4,2").split(","))
 # The sample size, matching GPQA-Diamond's. `LIMIT` is for smoke tests, not the reported run.
@@ -106,7 +104,6 @@ def load_items(rng) -> list[tuple[str, list[str], int]]:
     return items
 
 
-@torch.no_grad()
 def correctness(model, tok, items, dev, pad_id: int) -> np.ndarray:
     """`[n]` bool: did this arm rank the gold option first, item by item.
 
@@ -116,31 +113,34 @@ def correctness(model, tok, items, dev, pad_id: int) -> np.ndarray:
     divided by the option's length because the options differ in length and an unnormalized
     sum would simply prefer the shortest one.
     """
-    hit = np.zeros(len(items), dtype=bool)
-    for i, (ctx, choices, gold) in enumerate(items):
-        cid = tok(ctx, return_tensors="pt").input_ids[0]
-        seqs, lens = [], []
-        for c in choices:
-            ch = tok(c, add_special_tokens=False, return_tensors="pt").input_ids[0]
-            seqs.append(torch.cat([cid, ch]))
-            lens.append(len(ch))
-        w = max(len(x) for x in seqs)
-        inp = torch.full((len(seqs), w), pad_id, dtype=torch.long)
-        att = torch.zeros((len(seqs), w), dtype=torch.long)
-        for j, sq in enumerate(seqs):
-            inp[j, : len(sq)] = sq
-            att[j, : len(sq)] = 1
-        lg = model(input_ids=inp.to(dev), attention_mask=att.to(dev)).logits.float()
-        lp = torch.log_softmax(lg[:, :-1], -1)
-        tot = []
-        for j, sq in enumerate(seqs):
-            n, k = len(sq), lens[j]
-            tgt = sq[n - k : n].to(dev)
-            tot.append(lp[j, n - k - 1 : n - 1].gather(-1, tgt[:, None]).sum().item() / k)
-        hit[i] = int(np.argmax(tot)) == gold
-        if (i + 1) % 50 == 0:
-            print(f"  {i + 1}/{len(items)} items", flush=True)
-    return hit
+    import torch
+
+    with torch.no_grad():
+        hit = np.zeros(len(items), dtype=bool)
+        for i, (ctx, choices, gold) in enumerate(items):
+            cid = tok(ctx, return_tensors="pt").input_ids[0]
+            seqs, lens = [], []
+            for c in choices:
+                ch = tok(c, add_special_tokens=False, return_tensors="pt").input_ids[0]
+                seqs.append(torch.cat([cid, ch]))
+                lens.append(len(ch))
+            w = max(len(x) for x in seqs)
+            inp = torch.full((len(seqs), w), pad_id, dtype=torch.long)
+            att = torch.zeros((len(seqs), w), dtype=torch.long)
+            for j, sq in enumerate(seqs):
+                inp[j, : len(sq)] = sq
+                att[j, : len(sq)] = 1
+            lg = model(input_ids=inp.to(dev), attention_mask=att.to(dev)).logits.float()
+            lp = torch.log_softmax(lg[:, :-1], -1)
+            tot = []
+            for j, sq in enumerate(seqs):
+                n, k = len(sq), lens[j]
+                tgt = sq[n - k : n].to(dev)
+                tot.append(lp[j, n - k - 1 : n - 1].gather(-1, tgt[:, None]).sum().item() / k)
+            hit[i] = int(np.argmax(tot)) == gold
+            if (i + 1) % 50 == 0:
+                print(f"  {i + 1}/{len(items)} items", flush=True)
+        return hit
 
 
 def mcnemar(base: np.ndarray, arm: np.ndarray) -> dict:
@@ -162,6 +162,12 @@ def mcnemar(base: np.ndarray, arm: np.ndarray) -> dict:
 
 
 def main() -> None:
+    import torch
+    from transformers import AutoTokenizer
+
+    import moe
+
+    assert MODEL and TAG, "MODEL and TAG are required for the measurement"
     cfg, n_experts, top_k = moe.routing_cfg(MODEL, N_GPUS)
     print(f"{TAG}: E={n_experts} top_k={top_k} G={N_GPUS}", flush=True)
     items = load_items(np.random.default_rng(0))

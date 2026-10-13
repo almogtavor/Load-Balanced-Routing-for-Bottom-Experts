@@ -74,6 +74,13 @@ and a fixed token batch, so no arm can look fast by doing less; accuracy is GPQA
 option likelihood, paired per item. The honest resolution of the y axis is `base2` - the stock
 engine loaded and measured a second time - and the figure draws that band.
 
+Three families, not four: vLLM 0.31 has no native Hunyuan-MoE implementation and serves
+`HunYuanMoEV1ForCausalLM` through its Transformers backend, which executes the checkpoint's own
+modelling file - and that file still selects attention from a hard-coded class dict, so it
+rejects the `vllm` attention implementation the backend installs. Hunyuan therefore appears in
+the offline sweep only. Making it load would mean rewriting someone's modelling code and then
+measuring that, which is not the same experiment.
+
 **Offline, isolating the all-to-all - `experiments/{accuracy,bench,latency}.py`.** The vLLM
 number is end-to-end, so a real saving in the dispatch shows up diluted by everything else in
 a forward pass. The offline sweep replays recorded routing through one hand-built

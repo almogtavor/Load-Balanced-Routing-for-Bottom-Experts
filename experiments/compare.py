@@ -33,10 +33,24 @@ import matplotlib.pyplot as plt  # noqa: E402
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import bench  # noqa: E402
 
-TAGS = os.environ.get("TAGS", "q30rh,q35,hy13b,gm26b").split(",")
-LABEL = {"q30rh": "Qwen3-30B-A3B", "q35": "Qwen3.5-35B",
-         "hy13b": "Hunyuan-A13B", "gm26b": "Gemma-4-26B-A4B"}
-COLOR = {"q30rh": "#1f77b4", "q35": "#d62728", "hy13b": "#2ca02c", "gm26b": "#9467bd"}
+# A tag is one (model, all-to-all backend) pair, because the backend decides whether the
+# dispatch volume this kernel shrinks is the volume the engine actually moves. The `dp` tags are
+# DeepEP, measured through a real server by `serve_run.py` (`serve_*.json`); the others are vLLM
+# 0.31's default `allgather_reducescatter`, measured offline by `vllm_run.py` (`vllm_*.json`).
+#
+# A `dp` run measures throughput only, and takes its x from the same model's allgather run. That
+# is not an approximation: which experts a token is routed to is decided by the router, and the
+# all-to-all backend only changes how the tokens then move. Same model, same rule, same items,
+# same selection - so the accuracy is the same measurement, and running it twice would only add
+# a second sample of GPQA noise.
+ACC_FROM = {"q30dp": "q30rh", "q35dp": "q35", "gmdp": "gm26b"}
+TAGS = os.environ.get("TAGS", "q30rh,q35,gm26b,q30dp,q35dp,gmdp").split(",")
+LABEL = {"q30rh": "Qwen3-30B-A3B, allgather", "q35": "Qwen3.5-35B, allgather",
+         "hy13b": "Hunyuan-A13B", "gm26b": "Gemma-4-26B-A4B, allgather",
+         "q30dp": "Qwen3-30B-A3B, DeepEP", "q35dp": "Qwen3.5-35B, DeepEP",
+         "gmdp": "Gemma-4-26B-A4B, DeepEP"}
+COLOR = {"q30rh": "#aec7e8", "q35": "#ff9896", "hy13b": "#2ca02c", "gm26b": "#c5b0d5",
+         "q30dp": "#1f77b4", "q35dp": "#d62728", "gmdp": "#9467bd"}
 RUNS = pathlib.Path("runs")
 OUT = RUNS / "vllm.png"
 
@@ -63,8 +77,9 @@ def perm_p(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def arms(tag: str) -> dict[str, dict]:
+    pre = "serve" if tag in ACC_FROM else "vllm"
     return {p.stem.split("_", 2)[2]: json.loads(p.read_text())
-            for p in sorted(RUNS.glob(f"vllm_{tag}_*.json"))}
+            for p in sorted(RUNS.glob(f"{pre}_{tag}_*.json"))}
 
 
 def rows(tag: str) -> list[dict]:
@@ -73,12 +88,19 @@ def rows(tag: str) -> list[dict]:
     if "base" not in a:
         return []
     base = a["base"]
+    # Where the accuracy of this arm was measured: its own file, or the same model's allgather
+    # run for a throughput-only `dp` tag.
+    acc = arms(ACC_FROM[tag]) if tag in ACC_FROM else a
     out = []
     for name, r in a.items():
         if name == "base":
             continue
-        assert len(r["gpqa_hit"]) == len(base["gpqa_hit"]), f"{tag}/{name}: item count moved"
-        m = bench.mcnemar(np.array(base["gpqa_hit"], bool), np.array(r["gpqa_hit"], bool))
+        if name not in acc or "base" not in acc:
+            print(f"[skip arm] {tag}/{name}: no accuracy run to pair it with")
+            continue
+        ab, ar = acc["base"], acc[name]
+        assert len(ar["gpqa_hit"]) == len(ab["gpqa_hit"]), f"{tag}/{name}: item count moved"
+        m = bench.mcnemar(np.array(ab["gpqa_hit"], bool), np.array(ar["gpqa_hit"], bool))
         wa, wb = warm(r), warm(base)
         # Ratio of means with the delta method, so the error bar on the figure is the error on
         # the quantity actually plotted rather than on either arm alone.
@@ -102,7 +124,8 @@ def main() -> None:
     for tag in TAGS:
         rs = rows(tag)
         if not rs:
-            print(f"[skip] {tag}: no vllm_{tag}_base.json")
+            pre = "serve" if tag in ACC_FROM else "vllm"
+            print(f"[skip] {tag}: no {pre}_{tag}_base.json")
             continue
         drawn.append(tag)
         c = COLOR.get(tag, "#777777")

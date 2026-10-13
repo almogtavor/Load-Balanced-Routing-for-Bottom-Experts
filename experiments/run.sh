@@ -18,8 +18,12 @@ if [ -n "${ARMS:-}" ]; then
   # The Triton path has no CPU fallback to be checked against on a laptop, so the first thing
   # a GPU job does is prove it agrees with the reference on this hardware.
   "${PY}" src/par/kernel.py
+  # SERVE=1 measures through a real `vllm serve` instead of the offline API, which is the
+  # only way to reach the DeepEP dispatch - see the header of serve_run.py.
+  if [ "${SERVE:-0}" = "1" ]; then script=experiments/serve_run.py
+  else script=experiments/vllm_run.py; fi
   for arm in ${ARMS//,/ }; do
-    ARM="${arm}" "${PY}" experiments/vllm_run.py
+    ARM="${arm}" "${PY}" "${script}"
   done
   exit 0
 fi

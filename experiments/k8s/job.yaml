@@ -70,6 +70,15 @@ spec:
         - {name: TF4, value: "${TF4}"}
         # Non-empty switches run.sh to the vLLM path: one engine per listed arm, in order.
         - {name: ARMS, value: "${ARMS}"}
+        # The all-to-all backend. Empty leaves vLLM's default (`allgather_reducescatter`),
+        # whose dispatch volume is independent of per-token rank fan-out and therefore has
+        # nothing for this kernel to save.
+        - {name: A2A, value: "${A2A}"}
+        # SERVE=1 switches the arm loop to a real `vllm serve`, which is the only shape in
+        # which vLLM 0.31 builds the DeepEP all-to-all: the gate is data parallelism, and that
+        # needs one process per rank. DP splits GPUS, so DP=2 at GPUS=4 is tp=2 with 4-way EP.
+        - {name: SERVE, value: "${SERVE}"}
+        - {name: DP, value: "${DP}"}
         - {name: TFVER, value: "${TFVER}"}
         - {name: MODEL, value: "${MODEL}"}
         - {name: TAG, value: "${TAG}"}

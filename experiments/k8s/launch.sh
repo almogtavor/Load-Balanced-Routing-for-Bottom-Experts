@@ -7,7 +7,11 @@
 #   ./launch.sh NAME=gm  TAG=gm26b MODEL=/models/gm_bf16
 #
 # `ARMS=base,base2,6,4,2` switches the job to the real vLLM measurement, one engine load per
-# arm; the offline three-phase run is what you get without it.
+# arm; the offline three-phase run is what you get without it. Adding `SERVE=1 DP=2` runs those
+# arms against a real `vllm serve` on the DeepEP dispatch instead of the offline API, which is
+# the only shape where the volume this kernel shrinks is the volume the engine moves - vLLM's
+# default all-gathers, and 0.31 gates the all-to-all kernels on data parallelism. Give those
+# runs their own TAG (`q30dp`, `q35dp`, `gmdp`); the backend is a measurement condition.
 #
 # Add `NODE=<hostname>` to pin a run to one node, which is how you get off a node whose GPU
 # has fallen off the bus - the packing scheduler is deterministic and will keep choosing it.
@@ -22,7 +26,7 @@ set -euo pipefail
 : "${GPUS:=4}" ; : "${MEM:=700Gi}" ; : "${TF4:=0}" ; : "${TFVER:=4.57.1}"
 : "${BATCH:=4}" ; : "${NWIN:=32}" ; : "${KEEPS:=6,4,2}"
 : "${STREAM:=multilingual}" ; : "${TOKREF:=/models/qwen_tok}" ; : "${NODE:=}"
-: "${ARMS:=}" ; : "${IMG:=v0.31.0}"
+: "${ARMS:=}" ; : "${IMG:=v0.31.0}" ; : "${A2A:=}" ; : "${SERVE:=0}" ; : "${DP:=2}"
 
 for kv in "$@"; do export "${kv?}"; done
 [ -n "${NAME}" ] && [ -n "${TAG}" ] && [ -n "${MODEL}" ] || {
@@ -30,9 +34,9 @@ for kv in "$@"; do export "${kv?}"; done
 
 # `nodeSelector: {${NODE}}`, so the pin is a whole `key: value` pair, not just a hostname.
 NODE="${NODE:+kubernetes.io/hostname: ${NODE}}"
-export NAME TAG MODEL GPUS MEM TF4 TFVER BATCH NWIN KEEPS STREAM TOKREF NODE ARMS IMG
+export NAME TAG MODEL GPUS MEM TF4 TFVER BATCH NWIN KEEPS STREAM TOKREF NODE ARMS IMG A2A SERVE DP
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 oc delete job "par-${NAME}" --ignore-not-found >/dev/null
-envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $ARMS $IMG' \
+envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $ARMS $IMG $A2A $SERVE $DP' \
   < "${here}/job.yaml" | oc apply -f -
-echo "launched par-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} tf4=${TF4} arms=${ARMS:-offline}"
+echo "launched par-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} tf4=${TF4} arms=${ARMS:-offline} a2a=${A2A:-default} serve=${SERVE} dp=${DP}"

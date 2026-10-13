@@ -188,8 +188,16 @@ def _check() -> None:
             # or every other arm is measuring the rewrite's own perturbation.
             if keep == K:
                 assert torch.equal(got.sort(-1).values, bb.sort(-1).values), "no-op"
-        w = gate_weights(z, rewrite_torch(z, base, keep, G), renormalize=True)
+        ids = rewrite_torch(z, base, keep, G)
+        w = gate_weights(z, ids, renormalize=True)
         assert torch.allclose(w.sum(-1), torch.ones(T), atol=1e-5)
+        # The plugin does not use `gate_weights` on a real router: it masks every unselected
+        # expert to the dtype floor and lets the router weight the selection itself. That is
+        # only exact because renormalizing over the selection divides out the softmax
+        # denominator the mask changed, which is the identity asserted here.
+        masked = torch.full_like(z, torch.finfo(z.dtype).min).scatter_(1, ids.long(),
+                                                                      z.gather(1, ids.long()))
+        assert torch.allclose(masked.softmax(-1).gather(1, ids.long()), w, atol=1e-6)
         print(f"  keep={keep} fan-out {fanout(rewrite_torch(z, base, keep, G), G, E).float().mean():.3f} "
               f"(expected {closed_form(keep):.3f})")
     print(f"par.kernel: ok (triton {'present' if triton else 'absent'})")

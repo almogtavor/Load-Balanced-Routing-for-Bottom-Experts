@@ -48,6 +48,15 @@ GEN_LEN = int(os.environ.get("GEN_LEN", 128))
 # rest are the sample. Engine load dominates the job, so a repeat is nearly free - and one
 # warm number per arm would leave no within-arm spread to compare an arm gap against.
 REPEATS = int(os.environ.get("REPEATS", 6))
+# Which all-to-all the engine dispatches through. vLLM 0.31 defaults to
+# `allgather_reducescatter`, which gathers every token onto every rank: its volume does not
+# depend on per-token rank fan-out, so there is nothing for this kernel to save here and its
+# extra launches are pure cost. That is the stock serving shape and the number this script
+# reports. The DeepEP path, whose volume *is* `sum_t d(t)`, cannot be reached from the offline
+# API at all - it is gated on data or prefill-context parallelism, offline data parallelism
+# refuses to run in one process, and prefill-context parallelism has no attention backend in
+# 0.31 - so it is measured against a real server in `serve_run.py`.
+A2A = os.environ.get("A2A", "")
 OUT = pathlib.Path("runs")
 
 
@@ -59,7 +68,8 @@ def engine():
     return LLM(model=MODEL, tensor_parallel_size=N_GPUS, enable_expert_parallel=True,
                trust_remote_code=True, max_model_len=MAX_LEN, seed=0,
                enable_prefix_caching=False,
-               gpu_memory_utilization=float(os.environ.get("GPU_UTIL", 0.90)))
+               gpu_memory_utilization=float(os.environ.get("GPU_UTIL", 0.90)),
+               **({"all2all_backend": A2A} if A2A else {}))
 
 
 def gpqa(llm) -> np.ndarray:
@@ -128,8 +138,8 @@ def main() -> None:
         os.environ.pop("PAR_KEEP", None)
     else:
         os.environ["PAR_KEEP"] = str(keep)
-    print(f"[{TAG}/{ARM}] PAR_KEEP={os.environ.get('PAR_KEEP', '<unset>')} gpus={N_GPUS}",
-          flush=True)
+    print(f"[{TAG}/{ARM}] PAR_KEEP={os.environ.get('PAR_KEEP', '<unset>')} gpus={N_GPUS} "
+          f"a2a={A2A or '<default>'}", flush=True)
 
     llm = engine()
     hit = gpqa(llm)
@@ -140,7 +150,7 @@ def main() -> None:
     OUT.mkdir(exist_ok=True)
     (OUT / f"vllm_{TAG}_{ARM}.json").write_text(json.dumps({
         "tag": TAG, "model": MODEL, "arm": ARM, "keep": keep, "n_gpus": N_GPUS,
-        "vllm": __import__("vllm").__version__,
+        "vllm": __import__("vllm").__version__, "a2a": A2A or "<default>",
         "n_req": N_REQ, "prompt_len": PROMPT_LEN, "gen_len": GEN_LEN,
         "gpqa_acc": float(hit.mean()), "gpqa_hit": hit.astype(int).tolist(),
         "throughput": tp,
