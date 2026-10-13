@@ -65,18 +65,28 @@ serve garbage.
 
 ## What it measures out at
 
-In a stock vLLM 0.31 engine, four GPUs, expert-parallel, the rule **costs throughput and does
-not pay for it**. Decode throughput vs. the unmodified engine, mean of five warm repeats:
+**The throughput numbers are withdrawn and being re-measured.** The arms that produced them
+ran a kernel that mishandled vLLM's padded rows, and the mishandling fell on the rule's side
+of the comparison only, so the cost it reported is an upper bound on the real one and not an
+estimate of it.
 
-| | `base2` (repeat) | `keep=6` | `keep=4` | `keep=2` |
-| --- | --- | --- | --- | --- |
-| Qwen3-30B-A3B | -0.71% | -8.42% | -10.56% | -16.30% |
-| Qwen3.5-35B | +0.39% | -6.69% | -7.96% | -11.45% |
-| Gemma-4-26B-A4B | +0.21% | -4.06% | -5.77% | -10.66% |
+vLLM pads a batch for cudagraph and data-parallel capture and marks the padding by forcing
+those tokens' expert ids to `-1`, so the dispatch and the experts drop them
+(`VLLM_MOE_SKIP_PADDING`, on by default since 0.31). A `-1` is not a selection, and the first
+kernel treated it as one: its `argmax` ran over an all-`-inf` block, fewer than `top_k` output
+slots got written, and the row came out holding whatever `torch.empty` had left there. Real
+expert ids, for tokens the unmodified engine never dispatches. The baseline arms skipped that
+padding and the rule's arms paid full dispatch and expert GEMM for it - at decode batch sizes,
+where padding is a large fraction of the captured batch, that is most of a measurement.
 
-Every keep arm clears the repeat baseline at `p=0.008`, the exact permutation floor at five
-repeats an arm; no `base2` arm does. The loss grows monotonically as `keep` falls on all three
-families, which is the cost of rewriting more ids per layer.
+It also explains the one failure that was not a quiet bias: a `-1` reaching Gemma's index
+scatter asserted out of bounds mid-run (`ScatterGatherKernel.cu:203`).
+
+The kernel now declines any row that is not `top_k` distinct in-range experts and returns it
+byte-for-byte, sentinel included; `src/par/kernel.py` asserts that on GPU before any arm runs.
+The structural claim below is unaffected - it is a property of the dispatch, not of the rule's
+per-layer cost - and so are the quality numbers: vLLM's fused MoE imposes no expert capacity,
+so a padded token routed by mistake costs time and takes nothing from a real token's output.
 
 The reason there is nothing on the other side of it is the dispatch. vLLM 0.31 defaults to
 `allgather_reducescatter`, which gathers every token onto every rank: the volume it moves does

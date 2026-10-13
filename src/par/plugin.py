@@ -162,12 +162,21 @@ def _masked_select_experts(inner):
         # routing function is the only way to keep Gemma's per-expert output scale. Its top-k
         # can only resolve the mask to `ids`, and renormalization over the selection (guarded
         # in `_unsupported`) divides out the softmax denominator the mask changed.
-        ids = rewrite(router_logits, topk_ids, keep, ep_size())[0].long()
+        ids = rewrite(router_logits, topk_ids, topk_weights, keep, ep_size())[0].long()
+        # vLLM marks cudagraph and DP padding by forcing a token's expert ids to -1 so the
+        # dispatch and the experts drop it (`VLLM_MOE_SKIP_PADDING`, on by default). The kernel
+        # passes that sentinel through; a masked re-run cannot, since its top-k has to return
+        # real experts. So clamp for the gather and put the untouched rows back afterwards -
+        # routing a padded token would both add dispatch volume this arm does not owe and make
+        # `keep == top_k` stop being a no-op.
+        pad = (ids.amin(1) < 0).unsqueeze(1)
+        safe = ids.clamp_min(0)
         masked = torch.full_like(router_logits, torch.finfo(router_logits.dtype).min)
-        masked.scatter_(1, ids, router_logits.gather(1, ids))
+        masked.scatter_(1, safe, router_logits.gather(1, safe))
         w, out = self._compute_routing(hidden_states, masked, topk_indices_dtype,
                                        input_ids=input_ids)
-        return w, self._convert_indices_dtype(out, topk_indices_dtype)
+        out = self._convert_indices_dtype(out, topk_indices_dtype)
+        return torch.where(pad, topk_weights, w), torch.where(pad, topk_ids.to(out.dtype), out)
 
     return _select_experts
 

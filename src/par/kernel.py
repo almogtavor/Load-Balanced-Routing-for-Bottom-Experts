@@ -91,7 +91,7 @@ def rewrite_torch(logits: torch.Tensor, topk_ids: torch.Tensor, keep: int,
 if triton is not None:
 
     @triton.jit
-    def _par_rewrite(logits_ptr, ids_ptr, out_ptr, w_ptr, stride_lm, E,
+    def _par_rewrite(logits_ptr, ids_ptr, win_ptr, out_ptr, w_ptr, stride_lm, E,
                      K: tl.constexpr, KEEP: tl.constexpr, N_RANKS: tl.constexpr,
                      BLOCK_E: tl.constexpr):
         m = tl.program_id(0)
@@ -104,61 +104,84 @@ if triton is not None:
 
         cur = offs < 0                                                 # all-false bool block
         for i in range(K):
-            cur = cur | (offs == tl.load(ids_ptr + m * K + i).to(tl.int32))
+            # `& live` is the range check: an id outside `[0, E)` lights no lane, so the count
+            # below sees it as missing rather than as an expert at a dead lane.
+            cur = cur | ((offs == tl.load(ids_ptr + m * K + i).to(tl.int32)) & live)
 
-        taken = offs < 0
-        slot = offs * 0
-        hot = 0
-        # The head, recovered in descending-score order by `KEEP` argmax passes over the
-        # incoming selection. Each pass also records the rank it forces a visit to, and the
-        # output slot its winner owns - nothing is written out until both loops are done, so
-        # the whole selection stays in registers and the weights below can see it.
-        for i in range(KEEP):
-            e = tl.argmax(tl.where(cur & ~taken, z, -float("inf")), axis=0)
-            taken = taken | (offs == e)
-            slot = tl.where(offs == e, i, slot)
-            hot = hot | (1 << (e * N_RANKS // E))
+        if tl.sum(tl.where(cur, 1, 0)) == K:
+            taken = offs < 0
+            slot = offs * 0
+            hot = 0
+            # The head, recovered in descending-score order by `KEEP` argmax passes over the
+            # incoming selection. Each pass also records the rank it forces a visit to, and the
+            # output slot its winner owns - nothing is written out until both loops are done, so
+            # the whole selection stays in registers and the weights below can see it.
+            for i in range(KEEP):
+                e = tl.argmax(tl.where(cur & ~taken, z, -float("inf")), axis=0)
+                taken = taken | (offs == e)
+                slot = tl.where(offs == e, i, slot)
+                hot = hot | (1 << (e * N_RANKS // E))
 
-        on_hot = ((hot >> rank) & 1) == 1
-        for i in range(K - KEEP):
-            e = tl.argmax(tl.where(on_hot & ~taken, z, -float("inf")), axis=0)
-            taken = taken | (offs == e)
-            slot = tl.where(offs == e, KEEP + i, slot)
+            on_hot = (((hot >> rank) & 1) == 1) & live
+            for i in range(K - KEEP):
+                e = tl.argmax(tl.where(on_hot & ~taken, z, -float("inf")), axis=0)
+                taken = taken | (offs == e)
+                slot = tl.where(offs == e, KEEP + i, slot)
 
-        # The gate weights of the new selection, from the row still in registers. With
-        # renormalization an expert's weight is the softmax over the selection alone, so the
-        # `E - K` other lanes contribute nothing and this is one max and one sum: they sit at
-        # -inf and exponentiate to zero, which is why they can be summed over regardless.
-        zt = tl.where(taken, z, -float("inf"))
-        p = tl.exp(zt - tl.max(zt, axis=0))
-        # Exactly `K` lanes are taken and they hold distinct slots, so these two masked
-        # scatters write each output position once.
-        tl.store(out_ptr + m * K + slot, offs, mask=taken)
-        tl.store(w_ptr + m * K + slot, p / tl.sum(p, axis=0), mask=taken)
+            # The gate weights of the new selection, from the row still in registers. With
+            # renormalization an expert's weight is the softmax over the selection alone, so the
+            # `E - K` other lanes contribute nothing and this is one max and one sum: they sit at
+            # -inf and exponentiate to zero, which is why they can be summed over regardless.
+            zt = tl.where(taken, z, -float("inf"))
+            p = tl.exp(zt - tl.max(zt, axis=0))
+            # Exactly `K` lanes are taken and they hold distinct slots - the count above is what
+            # makes that true, and a hot rank's block holds `E/G >= K` experts so neither loop
+            # can run out of candidates - so these two masked scatters write each output
+            # position once. Were a slot left unwritten it would keep whatever `torch.empty`
+            # handed us, and the engine indexes real buffers with these ids.
+            tl.store(out_ptr + m * K + slot, offs, mask=taken)
+            tl.store(w_ptr + m * K + slot, p / tl.sum(p, axis=0), mask=taken)
+        else:
+            # Not `K` distinct in-range experts, so not a top-k selection this rule can rewrite
+            # - and vLLM does hand those over: `fused_topk` allocates `topk_ids` with
+            # `torch.empty` and its top-k kernel leaves padded tokens untouched, so a padded
+            # row holds whatever was in that memory. Copy the row straight through. The engine
+            # discards those rows anyway; what it will not survive is an id invented for one.
+            sel = offs < K
+            tl.store(out_ptr + m * K + offs,
+                     tl.load(ids_ptr + m * K + offs, mask=sel, other=0), mask=sel)
+            tl.store(w_ptr + m * K + offs,
+                     tl.load(win_ptr + m * K + offs, mask=sel, other=0.0), mask=sel)
 
 
-def rewrite_triton(logits: torch.Tensor, topk_ids: torch.Tensor, keep: int,
-                   n_ranks: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """One program per token, no `[T, E]` temporary. Returns `(ids, gate weights)`."""
+def rewrite_triton(logits: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor,
+                   keep: int, n_ranks: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """One program per token, no `[T, E]` temporary. Returns `(ids, gate weights)`.
+
+    `topk_weights` is only read for a row the rewrite declines, which it returns unchanged.
+    """
     t, e = logits.shape
     k = topk_ids.shape[1]
     out = torch.empty_like(topk_ids, dtype=torch.int32)
     w = torch.empty(t, k, dtype=torch.float32, device=logits.device)
-    _par_rewrite[(t,)](logits, topk_ids.to(torch.int32).contiguous(), out, w, logits.stride(0),
+    _par_rewrite[(t,)](logits, topk_ids.to(torch.int32).contiguous(),
+                       topk_weights.to(torch.float32).contiguous(), out, w, logits.stride(0),
                        e, K=k, KEEP=keep, N_RANKS=n_ranks,
                        BLOCK_E=triton.next_power_of_2(e), num_warps=4)
     return out.to(topk_ids.dtype), w
 
 
-def rewrite(logits: torch.Tensor, topk_ids: torch.Tensor, keep: int,
-            n_ranks: int) -> tuple[torch.Tensor, torch.Tensor]:
+def rewrite(logits: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor,
+            keep: int, n_ranks: int) -> tuple[torch.Tensor, torch.Tensor]:
     """`rewrite_triton` where it can run, the reference everywhere else.
 
     `(ids, weights)`, because a caller that has to weight the selection itself is a caller
     paying for a second routing pass - see the module docstring.
     """
     if triton is not None and logits.is_cuda:
-        return rewrite_triton(logits.contiguous(), topk_ids, keep, n_ranks)
+        return rewrite_triton(logits.contiguous(), topk_ids, topk_weights, keep, n_ranks)
+    # The reference is the offline path and assumes a well-formed selection; the kernel is the
+    # one that meets vLLM's padded rows, and it is the one that checks for them.
     ids = rewrite_torch(logits, topk_ids, keep, n_ranks)
     return ids, gate_weights(logits, ids, renormalize=True)
 
@@ -204,7 +227,10 @@ def _check() -> None:
             # A router hands its picks over in whatever order its top-k produced, so the
             # rewrite is checked on a shuffled selection too.
             perm = bb.gather(1, torch.rand(T, K, device=dev).argsort(-1))
-            got, gw = rewrite(zz, perm, keep, G)
+            # Zeros for the incoming weights on purpose: a well-formed selection must never
+            # reach the kernel's pass-through branch, so the weight assertion below doubles as
+            # the canary for a gate that fires when it should not.
+            got, gw = rewrite(zz, perm, torch.zeros(T, K, device=dev), keep, G)
             ref = rewrite_torch(zz, bb, keep, G)
             assert torch.equal(got.sort(-1).values, ref.sort(-1).values), f"{dev} keep={keep}"
             # Exactly `K` distinct experts, and the head survives: the cost being measured has
@@ -236,6 +262,28 @@ def _check() -> None:
         assert torch.allclose(masked.softmax(-1).gather(1, ids.long()), w, atol=1e-6)
         print(f"  keep={keep} fan-out {fanout(rewrite_torch(z, base, keep, G), G, E).float().mean():.3f} "
               f"(expected {closed_form(keep):.3f})")
+    if torch.cuda.is_available():
+        # vLLM leaves a padded token's `topk_ids` row uninitialized, so the kernel is handed
+        # ids that are no selection at all. Such a row has to come back exactly as it arrived:
+        # the engine indexes real buffers with these ids, and the throughput phase of a serving
+        # benchmark is where the padded rows show up.
+        bad = base[:4].clone()
+        bad[0, 3] = -1                                                 # a sentinel
+        bad[1, 0] = 1 << 20                                            # plain garbage
+        bad[2, 2] = bad[2, 5]                                          # a repeat is not a top-k
+        bad, zz = bad.cuda(), z[:4].cuda()
+        win = torch.rand(4, K, device="cuda")
+        got, gw = rewrite(zz, bad, win, 4, G)
+        assert torch.equal(got[:3], bad[:3]), "declined rows must pass through unchanged"
+        assert torch.allclose(gw[:3], win[:3]), "declined rows keep their own weights"
+        assert got[3].sort().values.diff().min() > 0, "a sound row in the batch still rewrites"
+        # Not "the row changed" - that is only true with high probability. The rule itself is
+        # exact: every expert the rewritten row visits lives on a rank its top-`keep` already
+        # forced a visit to, so the row's rank set *is* its head's rank set.
+        head = {int(e) // (E // G) for e in zz[3].topk(4).indices}
+        assert {int(e) // (E // G) for e in got[3]} == head, "row collapsed onto its head"
+        print("  padded/garbage rows pass through, sound rows in the same batch do not")
+
     print(f"par.kernel: ok (triton {'present' if triton else 'absent'})")
 
 

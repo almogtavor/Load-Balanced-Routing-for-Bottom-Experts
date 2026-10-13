@@ -192,6 +192,8 @@ class FusedTopKRouter(BaseRouter):
         # attribute read - unless the rule's premise holds for this router.
         keep = par_keep(self, router_logits)
         if keep is not None:
-            topk_ids, topk_weights = rewrite(router_logits, topk_ids, keep, ep_size())
+            topk_ids, topk_weights = rewrite(
+                router_logits, topk_ids, topk_weights, keep, ep_size()
+            )
 
         return topk_weights, topk_ids
