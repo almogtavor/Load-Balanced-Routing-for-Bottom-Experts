@@ -284,14 +284,17 @@ def _check() -> None:
         ids = rewrite_torch(z, base, keep, G)
         w = gate_weights(z, ids, renormalize=True)
         assert torch.allclose(w.sum(-1), torch.ones(T), atol=1e-5)
-        # Gemma keeps its own gate: the plugin masks every unselected expert to the dtype
-        # floor and lets the model's routing function weight the selection itself. That is
-        # only exact because renormalizing over the selection divides out the softmax
-        # denominator the mask changed, which is the identity asserted here - the same one
-        # that lets the kernel emit the weights directly for every other router.
-        masked = torch.full_like(z, torch.finfo(z.dtype).min).scatter_(1, ids.long(),
-                                                                      z.gather(1, ids.long()))
-        assert torch.allclose(masked.softmax(-1).gather(1, ids.long()), w, atol=1e-6)
+        # Gemma keeps its own gate, and the plugin reproduces its weights rather than running
+        # it a second time. The reference below is vLLM's `gemma4_routing_function_torch`,
+        # inlined so that a change to it fails here: softmax over every expert, masked to the
+        # selection, renormalized over it, then scaled per expert. The first three steps are
+        # `gate_weights` - renormalizing divides out the denominator the mask changed - so
+        # only the scale has to be folded on. If this identity ever stops holding, Gemma's
+        # path has to go back to calling the router's own routing function.
+        scale = torch.rand(E) + 0.5
+        probs = z.softmax(-1) * torch.nn.functional.one_hot(ids.long(), E).sum(-2)
+        ref = (probs / probs.sum(-1, keepdim=True)).gather(1, ids.long()) * scale[ids.long()]
+        assert torch.allclose(w * scale[ids.long()], ref, atol=1e-6), "gemma scale fold"
         print(f"  keep={keep} fan-out {fanout(rewrite_torch(z, base, keep, G), G, E).float().mean():.3f} "
               f"(expected {closed_form(keep):.3f})")
     if torch.cuda.is_available():

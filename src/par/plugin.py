@@ -10,11 +10,11 @@ insert, so the rewrite happens inside the routing unit and emits its own gate we
 Triton launch per MoE layer, and nothing else added to the forward.
 
 `Gemma4Router` is the exception. It routes through `CustomRoutingRouter`, whose routing
-function lives in the model file and folds a learned per-expert output scale into its gate
-weights, so neither the unit nor the weights can be reproduced here. Gemma keeps the slower
-but exact route: rewrite the ids, then hand the selection back to the router's own routing
-function as logits with every other expert at the dtype floor. That costs a `[T, E]` mask and
-a second routing pass per layer, which is the price of not reimplementing someone's gate.
+function lives in the model file, so the unit itself cannot be swapped. Its weights can still
+be reached: that function is a softmax over every expert, masked to the selection and
+renormalized over it - which is the selection-scoped softmax the kernel already emits - with
+a learned per-expert output scale folded in afterwards. So Gemma rewrites the ids and gathers
+that scale onto the kernel's weights. One gather per layer, not a second routing pass.
 
 `PAR_KEEP` turns the whole thing on; unset, nothing is patched at all. Either path passes the
 selection through unchanged, once with a warning, wherever the rule does not apply:
@@ -131,19 +131,20 @@ def register() -> None:
         return
     _KEEP = int(os.environ["PAR_KEEP"])
     FusedTopKRouter._compute_routing = ParFusedTopKRouter._compute_routing
-    BaseRouter._select_experts = _masked_select_experts(BaseRouter._select_experts)
+    BaseRouter._select_experts = _gemma_select_experts(BaseRouter._select_experts)
     BaseRouter._par_patched = True
     # Only that the patch is in. Whether it *applies* is decided per router in the first
     # forward, and the expert-parallel group does not exist yet at plugin load time.
     _logger().info("par: router patched, keep=%d", _KEEP)
 
 
-def _masked_select_experts(inner):
-    """Gemma's path: rewrite the ids, let its own routing function weight them.
+def _gemma_select_experts(inner):
+    """Gemma's path: rewrite the ids, fold its per-expert scale onto the kernel's weights.
 
     Only for a listed `CustomRoutingRouter` - `FusedTopKRouter` is already handled inside the
-    vendored routing unit, and anything else passes through. Kept exact rather than fast
-    because the gate weights here are not a plain renormalized softmax.
+    vendored routing unit, and anything else passes through. Being listed in `_LOGIT_TOPK`
+    means both that the function selects by gate logit alone and that its weights are the
+    selection-scoped softmax times `per_expert_scale`, which is what this reconstructs.
     """
     from vllm.model_executor.layers.fused_moe.router.custom_routing_router import (
         CustomRoutingRouter)
@@ -158,24 +159,19 @@ def _masked_select_experts(inner):
         keep = par_keep(self, router_logits)
         if keep is None:
             return topk_weights, topk_ids
-        # The kernel's own weights are discarded here: a masked re-run through the router's
-        # routing function is the only way to keep Gemma's per-expert output scale. Its top-k
-        # can only resolve the mask to `ids`, and renormalization over the selection (guarded
-        # in `_unsupported`) divides out the softmax denominator the mask changed.
-        ids = rewrite(router_logits, topk_ids, topk_weights, keep, ep_size())[0]
+        ids, w = rewrite(router_logits, topk_ids, topk_weights, keep, ep_size())
         # vLLM marks cudagraph and DP padding by forcing a token's expert ids out of range so
         # the dispatch and the experts drop it (`VLLM_MOE_SKIP_PADDING`, on by default). The
-        # kernel passes such a row through; a masked re-run cannot, since its top-k has to
-        # return real experts. So clamp for the gather and put the untouched rows back
-        # afterwards - routing a padded token would both add dispatch volume this arm does not
-        # owe and make `keep == top_k` stop being a no-op.
+        # kernel passes such a row through and it has to stay that way, so the clamp here only
+        # keeps the scale gather in bounds and the untouched rows go back afterwards - routing
+        # a padded token would both add dispatch volume this arm does not owe and make
+        # `keep == top_k` stop being a no-op.
         pad, safe = unroutable(ids, router_logits.shape[-1])
-        masked = torch.full_like(router_logits, torch.finfo(router_logits.dtype).min)
-        masked.scatter_(1, safe, router_logits.gather(1, safe))
-        w, out = self._compute_routing(hidden_states, masked, topk_indices_dtype,
-                                       input_ids=input_ids)
-        out = self._convert_indices_dtype(out, topk_indices_dtype)
-        return torch.where(pad, topk_weights, w), torch.where(pad, topk_ids.to(out.dtype), out)
+        # Read off the router module at call time for the same reason the model file does: a
+        # `functional_call` parameter substitution has to reach it.
+        scale = self.custom_routing_function.__self__.per_expert_scale
+        w = w * scale[safe].to(w.dtype)
+        return torch.where(pad, topk_weights, w), torch.where(pad, topk_ids, ids)
 
     return _select_experts
 
