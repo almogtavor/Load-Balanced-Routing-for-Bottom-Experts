@@ -112,11 +112,14 @@ def rows(tag: str) -> list[dict]:
     for name, launches in a.items():
         if name == "base":
             continue
-        if name not in acc or "base" not in acc:
+        # A `base*` arm is the stock engine under a different sweep position, so its accuracy
+        # is `base`'s by construction and is not measured again. Every other arm needs its own.
+        src = "base" if name.startswith("base") else name
+        if src not in acc or "base" not in acc:
             print(f"[skip arm] {tag}/{name}: no accuracy run to pair it with")
             continue
         r = first(launches)
-        ab, ar = first(acc["base"]), first(acc[name])
+        ab, ar = first(acc["base"]), first(acc[src])
         assert len(ar["gpqa_hit"]) == len(ab["gpqa_hit"]), f"{tag}/{name}: item count moved"
         m = bench.mcnemar(np.array(ab["gpqa_hit"], bool), np.array(ar["gpqa_hit"], bool))
         # Language modelling, paired by window index. Same source as the accuracy: what the

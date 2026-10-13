@@ -42,7 +42,7 @@ import numpy as np
 
 MODEL = os.environ["MODEL"]
 TAG = os.environ["TAG"]
-ARM = os.environ.get("ARM", "base")                   # base | base2 | an integer `keep`
+ARM = os.environ.get("ARM", "base")                   # base* | an integer `keep`
 REP = os.environ.get("REP", "0")                      # which sweep; a launch is the unit
 N_GPUS = int(os.environ.get("GPUS", 4))
 MAX_LEN = int(os.environ.get("MAX_LEN", 2048))
@@ -186,7 +186,7 @@ def throughput(llm) -> list[dict]:
 
 
 def main() -> None:
-    keep = None if ARM in ("base", "base2") else int(ARM)
+    keep = None if ARM.startswith("base") else int(ARM)
     # The plugin reads this in every worker at load time. Setting it here rather than outside
     # keeps the arm name and the engine's actual configuration from drifting apart.
     if keep is None:

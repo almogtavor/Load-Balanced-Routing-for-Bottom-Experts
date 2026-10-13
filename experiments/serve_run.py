@@ -39,7 +39,7 @@ import numpy as np
 
 MODEL = os.environ["MODEL"]
 TAG = os.environ["TAG"]
-ARM = os.environ.get("ARM", "base")                   # base | base2 | an integer `keep`
+ARM = os.environ.get("ARM", "base")                   # base* | an integer `keep`
 REP = os.environ.get("REP", "0")                      # which sweep; a launch is the unit
 N_GPUS = int(os.environ.get("GPUS", 4))
 DP = int(os.environ.get("DP", 2))
@@ -119,7 +119,7 @@ def throughput(prompts: list[list[int]]) -> list[dict]:
 
 
 def main() -> None:
-    keep = None if ARM in ("base", "base2") else int(ARM)
+    keep = None if ARM.startswith("base") else int(ARM)
     if keep is None:
         os.environ.pop("PAR_KEEP", None)
     else:
