@@ -5,15 +5,20 @@
 #   vllm/model_executor/layers/fused_moe/router/fused_topk_router.py
 #
 # The only change is in `FusedTopKRouter._compute_routing`, marked `par:` below - two imports
-# and three lines that replace the bottom `top_k - keep` of the selection with experts on
-# ranks the head already visits. Everything else is upstream's, and the file is kept as a copy
-# rather than a patch so `git diff` against the upstream path is the whole story.
+# and four lines that hand the routing to `par.kernel.select` instead of `fused_topk`, which
+# picks the top `keep` by logit and fills the rest from ranks the head already visits.
+# Everything else is upstream's, and the file is kept as a copy rather than a patch so
+# `git diff` against the upstream path is the whole story.
 #
-# It is a copy because the rewrite has to happen *here*, between the fused top-k and the
-# dispatch: the router is the last place that still has the full `[T, E]` logits, which is
-# what choosing a substitute needs, and the dispatch is the first place that pays for
-# fan-out. Doing it a layer up instead - rewriting ids and handing them back for weighting -
-# costs a `[T, E]` mask and a second routing pass per MoE layer per forward.
+# It *replaces* the top-k rather than running after it, which is the whole performance story:
+# one Triton launch per MoE layer where stock vLLM also spends one, so `keep == top_k` is a
+# control arm that costs nothing measurable. Following the fused top-k instead would cost a
+# second launch per MoE layer per forward - ~3% of decode throughput at 48 layers, which
+# cudagraphs cannot amortise away because DeepEP with data parallelism disables them.
+#
+# It is a copy because the substitution has to happen *here*: the router is the last place
+# that still has the full `[T, E]` logits, which is what choosing a substitute needs, and the
+# dispatch is the first place that pays for fan-out.
 from collections.abc import Callable
 
 import torch
@@ -29,7 +34,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 
-from par.kernel import rewrite                                              # par
+from par.kernel import select                                               # par
 from par.plugin import ep_size, par_keep                                    # par
 
 
@@ -179,6 +184,15 @@ class FusedTopKRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using standard fused top-k."""
+        # par: the placement-aware kernel *is* the routing here, not a pass over its output,
+        # so this arm spends the one launch the fused top-k below would have spent. `par_keep`
+        # is `None` - one attribute read - unless the rule's premise holds for this router.
+        keep = par_keep(self, router_logits)
+        if keep is not None:
+            return select(router_logits, self.top_k, keep, ep_size(),
+                          _get_padding_mask(router_logits.shape[0]),
+                          indices_dtype=indices_type)
+
         topk_weights, topk_ids, token_expert_indices = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -187,13 +201,5 @@ class FusedTopKRouter(BaseRouter):
             indices_type=indices_type,
             scoring_func=self.scoring_func,
         )
-
-        # par: placement-aware rewrite of the bottom picks. `par_keep` is `None` - one
-        # attribute read - unless the rule's premise holds for this router.
-        keep = par_keep(self, router_logits)
-        if keep is not None:
-            topk_ids, topk_weights = rewrite(
-                router_logits, topk_ids, topk_weights, keep, ep_size()
-            )
 
         return topk_weights, topk_ids
