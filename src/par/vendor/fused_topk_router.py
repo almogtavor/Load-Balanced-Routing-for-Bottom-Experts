@@ -35,7 +35,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 
 from par.kernel import select                                               # par
-from par.plugin import ep_size, par_keep                                    # par
+from par.plugin import ep_size, par_alpha, par_keep                         # par
 
 
 def _get_padding_mask(num_tokens: int) -> torch.Tensor | None:
@@ -191,7 +191,7 @@ class FusedTopKRouter(BaseRouter):
         if keep is not None:
             return select(router_logits, self.top_k, keep, ep_size(),
                           _get_padding_mask(router_logits.shape[0]),
-                          indices_dtype=indices_type)
+                          indices_dtype=indices_type, alpha=par_alpha())
 
         topk_weights, topk_ids, token_expert_indices = fused_topk(
             hidden_states=hidden_states,

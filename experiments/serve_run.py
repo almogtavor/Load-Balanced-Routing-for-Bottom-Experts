@@ -39,7 +39,7 @@ import numpy as np
 
 MODEL = os.environ["MODEL"]
 TAG = os.environ["TAG"]
-ARM = os.environ.get("ARM", "base")                   # base* | an integer `keep`
+ARM = os.environ.get("ARM", "base")                   # base* | `keep` | `keep`a`alpha`
 REP = os.environ.get("REP", "0")                      # which sweep; a launch is the unit
 N_GPUS = int(os.environ.get("GPUS", 4))
 DP = int(os.environ.get("DP", 2))
@@ -185,12 +185,19 @@ def throughput(prompts: list[list[int]]) -> list[dict]:
 
 
 def main() -> None:
-    keep = None if ARM.startswith("base") else int(ARM)
+    # `4` is keep=4; `4a0.5` is keep=4 with the load penalty. Both in the arm name so a sweep
+    # needs no extra variable to carry them, and one filename still identifies the run.
+    k, _, a = ARM.partition("a")
+    keep = None if ARM.startswith("base") else int(k)
+    alpha = float(a) if a else 0.0
     if keep is None:
         os.environ.pop("PAR_KEEP", None)
+        os.environ.pop("PAR_ALPHA", None)
     else:
         os.environ["PAR_KEEP"] = str(keep)
-    print(f"[{TAG}/{ARM}] PAR_KEEP={os.environ.get('PAR_KEEP', '<unset>')} gpus={N_GPUS} "
+        os.environ["PAR_ALPHA"] = str(alpha)
+    print(f"[{TAG}/{ARM}] PAR_KEEP={os.environ.get('PAR_KEEP', '<unset>')} "
+          f"PAR_ALPHA={os.environ.get('PAR_ALPHA', '<unset>')} gpus={N_GPUS} "
           f"dp={DP * NODES} (local {DP}) tp={N_GPUS // DP} nodes={NODES} rank={RANK} "
           f"a2a={A2A}", flush=True)
     if RANK:
@@ -222,7 +229,8 @@ def main() -> None:
         # silently beside a fresh one. A missing field fails loudly; a stale number does not.
         "rep": int(REP),
         "written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "tag": TAG, "model": MODEL, "arm": ARM, "keep": keep, "n_gpus": N_GPUS,
+        "tag": TAG, "model": MODEL, "arm": ARM, "keep": keep, "alpha": alpha,
+        "n_gpus": N_GPUS,
         "vllm": __import__("vllm").__version__, "a2a": A2A, "dp": DP * NODES, "tp": N_GPUS // DP,
         "nodes": NODES, "ep_size": N_GPUS * NODES,
         "n_req": N_REQ, "prompt_len": PROMPT_LEN, "gen_len": GEN_LEN,

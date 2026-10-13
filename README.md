@@ -23,8 +23,12 @@ The saving is purely communication, which is why it has to be measured rather th
 
 ## Using it
 
-`PAR_KEEP` is the only knob. Unset, the plugin patches nothing and the image is stock vLLM -
-which is also the arm every claim here is compared against.
+`PAR_KEEP` is the knob. Unset, the plugin patches nothing and the image is stock vLLM - which
+is also the arm every claim here is compared against. `PAR_ALPHA` is the second one, defaulting
+to `0`: it charges each substituted slot that much per expert slot already placed on its
+destination rank, which flattens the load the plain rule piles onto the busiest rank at no cost
+in volume. It is worth setting wherever the router is skewed - see
+[why a smaller payload is not a faster step](#why-a-smaller-payload-is-not-a-faster-step).
 
 ```bash
 docker build -t par-vllm:v0.31.0 -f docker/Dockerfile .
@@ -235,26 +239,40 @@ reported next to every row as what that row can resolve.
 
 The rule looks like it does two things: moves fewer bytes, and makes a token wait on fewer
 GPUs. The first is true. The second is not, and `experiments/fanout.py` is what separates them.
-Three quantities decide a step, and the rule moves two of them:
+Every arm below is scored on the *same* logit draw, because the arms differ by a few percent
+and independent draws at 400 steps do not resolve that:
 
-| per step, `keep=4` vs `keep=8` | `ep=4`, B=256 | `ep=8`, B=256 |
-| --- | --- | --- |
-| volume on the wire | -24.1% | -37.4% |
-| ranks taking part in the collective | 4.00 -> 4.00 | 8.00 -> 8.00 |
-| busiest rank's share | -22.4% | -34.8% |
+| per step, `keep=4` vs `keep=8` | `ep=4` iid | `ep=4` skewed | `ep=8` iid | `ep=8` skewed |
+| --- | --- | --- | --- | --- |
+| volume on the wire | -24.1% | -24.2% | -37.3% | -37.3% |
+| ranks taking part in the collective | 4.00 -> 4.00 | 4.00 -> 4.00 | 8.00 -> 8.00 | 8.00 -> 7.99 |
+| busiest rank's dispatch count | -22.1% | -11.4% | -34.6% | -20.8% |
+| busiest rank's **expert work** | +2.0% | **+11.1%** | +4.4% | **+22.3%** |
+| the same, at `PAR_ALPHA=1` | +1.1% | **-0.5%** | +3.0% | **+7.2%** |
 
-The middle row is the answer. The all-to-all is **one collective per layer per step over the
-whole in-flight batch**, not one per token. Even 16 tokens at top-8 reach every rank with
-near-certainty, so the union of ranks is the full world size at every `keep` and no rank is
-ever dropped from the collective. The payload shrinks; the participation does not, and the
-fixed per-collective cost - launch, handshake, sync - is paid in full either way. There is no
-"waiting for fewer GPUs" to collect, at any `keep`.
+Two rows carry it. The participation row says the all-to-all is **one collective per layer per
+step over the whole in-flight batch**, not one per token: even 16 tokens at top-8 reach every
+rank with near-certainty, so the union of ranks is the full world size at every `keep` and no
+rank is ever dropped from the collective. The payload shrinks; the participation does not, and
+the fixed per-collective cost - launch, handshake, sync - is paid in full either way. There is
+no "waiting for fewer GPUs" to collect, at any `keep`.
 
-This also refutes the opposite worry, which is worth stating because it was ours: substitutes
-are drawn from ranks the head already visits, so one would expect traffic to pile onto hot
-ranks and eat the saving. It does not. The busiest rank's load falls -11% to -35%, under a
-gamma-skewed router as well as iid. Both the volume and the critical-path proxy improve, and
-still nothing is faster.
+The expert-work row is the cost, and it was ours to find: substitutes are drawn from ranks the
+head already visits, and the head visits popular ranks, so the tail piles onto whichever rank
+was already busiest. Summed expert slots are exactly `B * K` in every arm, so that rise is pure
+imbalance - **we shrink the sum and the step is set by the max**. The dispatch count falling
+-11% to -35% while the work behind it rises +11% to +22% under a skewed router is the whole
+discrepancy in one line, and an earlier version of this section read the first number as if it
+were the second.
+
+The last row is the fix, and it is the reason `PAR_ALPHA` exists. The kernel charges each tail
+pick `alpha` per expert slot already placed on that pick's rank. The tail stays confined to the
+head's ranks either way, so volume and busiest *dispatch* are unchanged by construction - the
+experiment asserts exact equality on both - and only *which* of those ranks a slot lands on
+moves. At `ep=4` skewed that converts +11.1% into -0.5%; at `ep=8` skewed it halves +22.3% to
++7.2%. `ALPHA` is a `tl.constexpr` defaulting to `0.0`, which compiles the penalty away, so the
+plain rule pays nothing for the option. Unlike `keep`, `alpha` changes which experts are picked,
+so it needs its own quality measurement and gets its own arm name (`4a1` is `keep=4, alpha=1`).
 
 Three things finish the explanation:
 
@@ -280,9 +298,12 @@ Three things finish the explanation:
   between where NVLink is the constraint. The payload saving can only convert where the link is
   slow enough to matter, which means across nodes over RDMA - the shape the tier note above
   describes, and the one we cannot currently schedule.
-* **Compute is untouched by construction.** The rule changes *which* rank holds a token's
-  expert, never how many experts it has, so the `sum_t k` expert-token GEMM pairs are identical
-  in every arm. Nothing is removed from the only part of the step that scales with the model.
+* **Compute is untouched in total, but not on the critical path.** The rule changes *which*
+  rank holds a token's expert, never how many experts it has, so the `sum_t k` expert-token
+  GEMM pairs are identical in every arm. Nothing is removed from the only part of the step that
+  scales with the model - and because that total is fixed while the busiest rank's share of it
+  rises, the rule *adds* to the critical path exactly as much as it takes off the wire. That is
+  the expert-work row above, and `alpha` is what cancels it.
 
 The regime that would test the rule properly is more nodes. What the rule caps is *ranks* - a
 token reaches at most `keep` of them - and nodes fall only as a consequence, so there is no
@@ -296,8 +317,15 @@ threshold, only saturation. Mean distinct nodes per token, top-8 against `keep=4
 
 At 2 nodes top-8 already reaches both, so there is nothing to confine. `keep=4` pins the count
 near 3.3-3.7 however wide the deployment goes, so the saving grows with node count without
-bound. And unlike the NVLink case the critical path moves with it: the busiest node drops
--34.6% iid and -21.1% skewed at 8 nodes, -40.2% and -25.5% at 16.
+bound. The busiest node's dispatch count drops with it: -34.7% iid and -21.2% skewed at 8
+nodes, -40.7% and -26.5% at 16.
+
+The imbalance follows the rule to that tier, though, and this is the part that qualifies the
+optimism above. Busiest node *work* rises +12.5% skewed over 4 nodes, +21.9% over 8 and +29.6%
+over 16 (iid: +1.9%, +4.2%, +6.8%). `alpha=1` only halves it there rather than erasing it -
++4.6%, +12.7%, +22.5% - because the penalty can flatten the tail across the head's ranks but a
+node holds several of them, and the head chose the node. A node-level penalty is the obvious
+next lever and is not implemented: `src/par/kernel.py` optimises distinct *ranks* only.
 
 Participation is invariant at the RDMA tier too, though (8.00 -> 8.00, 16.00 -> 16.00), so the
 per-collective floor is unchanged and a win needs the step to be RDMA-bandwidth-bound. Both
@@ -397,8 +425,9 @@ MODEL=/models/qwen3-30b-a3b TAG=q30rh ARMS=base,base2,6,4,2,base3 experiments/ru
 python experiments/compare.py
 
 # the DeepEP shape, where the volume this shrinks is the volume the engine moves
+# `4a1` is keep=4 with the load penalty, which is the arm the critical-path finding asks for
 MODEL=/models/qwen3-30b-a3b TAG=q30dp SERVE=1 DP=2 A2A=deepep_high_throughput \
-  ARMS=base,base2,6,4,2,base3 experiments/run.sh
+  ARMS=base,base2,6,4,4a1,2,base3 experiments/run.sh
 python experiments/paired.py
 
 # no GPU: which tier the saving lands on, and whether anything on the critical path moves

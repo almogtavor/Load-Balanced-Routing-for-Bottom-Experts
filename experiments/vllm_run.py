@@ -42,7 +42,7 @@ import numpy as np
 
 MODEL = os.environ["MODEL"]
 TAG = os.environ["TAG"]
-ARM = os.environ.get("ARM", "base")                   # base* | an integer `keep`
+ARM = os.environ.get("ARM", "base")                   # base* | `keep` | `keep`a`alpha`
 REP = os.environ.get("REP", "0")                      # which sweep; a launch is the unit
 N_GPUS = int(os.environ.get("GPUS", 4))
 MAX_LEN = int(os.environ.get("MAX_LEN", 2048))
@@ -186,14 +186,21 @@ def throughput(llm) -> list[dict]:
 
 
 def main() -> None:
-    keep = None if ARM.startswith("base") else int(ARM)
+    # `4` is keep=4; `4a0.5` adds the load penalty, which changes *which* experts are picked
+    # and so has to come through the quality arms too, not just the rate ones.
+    k, _, a = ARM.partition("a")
+    keep = None if ARM.startswith("base") else int(k)
+    alpha = float(a) if a else 0.0
     # The plugin reads this in every worker at load time. Setting it here rather than outside
     # keeps the arm name and the engine's actual configuration from drifting apart.
     if keep is None:
         os.environ.pop("PAR_KEEP", None)
+        os.environ.pop("PAR_ALPHA", None)
     else:
         os.environ["PAR_KEEP"] = str(keep)
-    print(f"[{TAG}/{ARM}] PAR_KEEP={os.environ.get('PAR_KEEP', '<unset>')} gpus={N_GPUS} "
+        os.environ["PAR_ALPHA"] = str(alpha)
+    print(f"[{TAG}/{ARM}] PAR_KEEP={os.environ.get('PAR_KEEP', '<unset>')} "
+          f"PAR_ALPHA={os.environ.get('PAR_ALPHA', '<unset>')} gpus={N_GPUS} "
           f"a2a={A2A or '<default>'}", flush=True)
 
     llm = engine()
@@ -211,7 +218,8 @@ def main() -> None:
         # silently beside a fresh one. A missing field fails loudly; a stale number does not.
         "rep": int(REP),
         "written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "tag": TAG, "model": MODEL, "arm": ARM, "keep": keep, "n_gpus": N_GPUS,
+        "tag": TAG, "model": MODEL, "arm": ARM, "keep": keep, "alpha": alpha,
+        "n_gpus": N_GPUS,
         "vllm": __import__("vllm").__version__, "a2a": A2A or "<default>",
         "n_req": N_REQ, "prompt_len": PROMPT_LEN, "gen_len": GEN_LEN,
         "gpqa_acc": float(hit.mean()), "gpqa_hit": hit.astype(int).tolist(),

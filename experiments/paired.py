@@ -21,7 +21,12 @@ import statistics as st
 # `written` is an ISO timestamp, so this is a string compare.
 CUT = "2026-10-13T10:40"
 
-KEEPS = ["8", "6", "4", "2", "1"]
+def arm_key(a):
+    """`4` is keep=4, `4a0.5` is keep=4 with the load penalty. Descending keep, ascending alpha."""
+    k, _, al = a.partition("a")
+    return -int(k), float(al or 0.0)
+
+
 # The rule moves communication volume, which is `ib_b_per_tok` directly and
 # `tot_tok_per_s` at a prefill-heavy shape. On the bytes metric a negative row is the
 # rule working; on the rate metrics a positive one is.
@@ -49,11 +54,15 @@ def decay(d):
 
 def main():
     runs, skipped = load()
+    # Read the arms off the artefacts rather than listing them here, so an arm added to a
+    # sweep shows up in the table without a second edit.
+    keeps = sorted({a for arms in runs.values() for a in arms if not a.startswith("base")},
+                   key=arm_key)
     print(f"excluded {skipped} artefacts written before the kernel fix ({CUT})")
     print(f"metric: {METRIC}")
     per_tag = collections.defaultdict(lambda: collections.defaultdict(list))
     print(f"{'tag':8} {'btok':>5} {'rep':>3} {'nb':>2} {'base':>8} {'spread%':>7} "
-          + " ".join(f"{'k=' + k:>8}" for k in KEEPS) + "  decay%")
+          + " ".join(f"{'k=' + k:>8}" for k in keeps) + "  decay%")
     for (tag, rep), arms in sorted(runs.items()):
         bases = [v[METRIC] for a, v in arms.items()
                  if a.startswith("base") and v.get(METRIC) is not None]
@@ -68,7 +77,7 @@ def main():
         assert len(bts) == 1, f"{tag} r{rep} mixes token budgets {bts}"
         bt = bts.pop()
         row = []
-        for k in KEEPS:
+        for k in keeps:
             if arms.get(k, {}).get(METRIC) is None:
                 row.append(f"{'-':>8}")
                 continue
@@ -82,7 +91,7 @@ def main():
     print("\nacross launches (mean of the per-launch ratios, n launches):")
     for key in sorted(per_tag):
         cells = (f"k={k} " + (f"{st.mean(v):+7.2f} (n={len(v)})" if (v := per_tag[key][k])
-                              else f"{'-':>13}") for k in KEEPS)
+                              else f"{'-':>13}") for k in keeps)
         print(f"  {key[0]:8} btok={key[1]:<5} " + " ".join(cells))
 
 

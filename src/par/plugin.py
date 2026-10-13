@@ -41,6 +41,7 @@ import os
 from par.kernel import select
 
 _KEEP: int | None = None
+_ALPHA = 0.0
 _EP: int | None = None
 _MISS = object()
 _warned: set[str] = set()
@@ -100,6 +101,16 @@ def par_keep(router, router_logits) -> int | None:
     return k
 
 
+def par_alpha() -> float:
+    """`PAR_ALPHA`: the load penalty charged per slot already placed on a tail pick's rank.
+
+    0.0 is the plain rule - minimise summed volume. Anything higher trades none of that volume
+    (the tail stays confined to the head's ranks either way) for a flatter spread over them,
+    which is what the step actually waits on. See the kernel docstring.
+    """
+    return _ALPHA
+
+
 def _shim_remote_code() -> None:
     """Hunyuan's vendored modelling file imports a transformers 4.x symbol that 5.x deleted.
 
@@ -116,7 +127,7 @@ def _shim_remote_code() -> None:
 
 def register() -> None:
     """vLLM `general_plugins` entry point. Idempotent, and a no-op without `PAR_KEEP`."""
-    global _KEEP
+    global _KEEP, _ALPHA
     _shim_remote_code()
     if os.environ.get("PAR_KEEP") is None:
         return
@@ -131,13 +142,14 @@ def register() -> None:
     if getattr(BaseRouter, "_par_patched", False):
         return
     _KEEP = int(os.environ["PAR_KEEP"])
+    _ALPHA = float(os.environ.get("PAR_ALPHA", 0.0))
     FusedTopKRouter._compute_routing = ParFusedTopKRouter._compute_routing
     CustomRoutingRouter._compute_routing = _gemma_compute_routing(
         CustomRoutingRouter._compute_routing)
     BaseRouter._par_patched = True
     # Only that the patch is in. Whether it *applies* is decided per router in the first
     # forward, and the expert-parallel group does not exist yet at plugin load time.
-    _logger().info("par: router patched, keep=%d", _KEEP)
+    _logger().info("par: router patched, keep=%d alpha=%g", _KEEP, _ALPHA)
 
 
 def _gemma_compute_routing(inner):
@@ -162,7 +174,7 @@ def _gemma_compute_routing(inner):
         # `functional_call` parameter substitution has to reach it.
         scale = self.custom_routing_function.__self__.per_expert_scale
         return select(router_logits, self.top_k, keep, ep_size(), scale=scale,
-                      indices_dtype=indices_type)
+                      indices_dtype=indices_type, alpha=_ALPHA)
 
     return _compute_routing
 
