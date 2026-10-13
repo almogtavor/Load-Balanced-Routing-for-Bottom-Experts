@@ -19,7 +19,9 @@
 # `NODES=4 GPUS=2 DP=2` is one pod per node, ep_size = DP * NODES = 8, spread over 4 hosts.
 # That is the shape this kernel needs to pay: DeepEP charges RDMA per distinct *node*, and
 # inside one node the top `keep` experts already reach every node, so a fan-out saving there
-# lands entirely on NVLink. Node count has to exceed `keep` before the tail can be confined.
+# lands entirely on NVLink. There is no threshold, only saturation: the tail can be confined
+# once a tier has more destinations than the top `keep` already reach, which at 2 nodes it
+# does not and at 8 it does.
 #
 # Syncing the code is deliberately a separate step - the results PVC is shared, so a launch
 # does not overwrite it behind your back:

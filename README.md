@@ -239,9 +239,26 @@ Three things finish the explanation:
   expert, never how many experts it has, so the `sum_t k` expert-token GEMM pairs are identical
   in every arm. Nothing is removed from the only part of the step that scales with the model.
 
-The regime that would test the rule properly is `nodes > keep`, where the top `keep` can no
-longer reach every node and the tail can actually be confined. `experiments/fanout.py` at 1 GPU
-per node puts `keep=4` at **-37.5%** on the RDMA tier at 8 nodes, against -5.9% at 2.
+The regime that would test the rule properly is more nodes. What the rule caps is *ranks* - a
+token reaches at most `keep` of them - and nodes fall only as a consequence, so there is no
+threshold, only saturation. Mean distinct nodes per token, top-8 against `keep=4`:
+
+| nodes | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- |
+| base top-8 | 1.99 | 3.62 | 5.32 | 6.58 |
+| `keep=4` | 1.88 | 2.74 | 3.33 | 3.67 |
+| | -5.9% | -24.3% | -37.5% | -44.2% |
+
+At 2 nodes top-8 already reaches both, so there is nothing to confine. `keep=4` pins the count
+near 3.3-3.7 however wide the deployment goes, so the saving grows with node count without
+bound. And unlike the NVLink case the critical path moves with it: the busiest node drops
+-34.6% iid and -21.1% skewed at 8 nodes, -40.2% and -25.5% at 16.
+
+Participation is invariant at the RDMA tier too, though (8.00 -> 8.00, 16.00 -> 16.00), so the
+per-collective floor is unchanged and a win needs the step to be RDMA-bandwidth-bound. Both
+DeepEP decode paths work against that: high-throughput disables CUDA graphs, and low-latency
+dispatches into a fixed padded buffer whose volume does not depend on fan-out at all.
+
 **That shape was built and never measured** - `NODES=` in `launch.sh` renders one pod per node
 with `rdma/roce_gdr`, and the job was killed before it wrote an artefact. It is an open
 question, not a refuted one, and it is the one experiment that could still turn this around.

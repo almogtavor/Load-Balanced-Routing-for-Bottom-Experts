@@ -43,15 +43,21 @@ def cost(sel, g, gpn):
     return vis.sum(), nod.sum()
 
 
-def step(rng, g, keep, B, skew, steps=400):
-    """Per-step volume, rank participation and busiest-rank load."""
+def step(rng, g, keep, B, skew, gpn=1, steps=400):
+    """Per-step volume, participation and busiest-destination load, one tier at a time.
+
+    `gpn=1` buckets by rank, which is the NVLink tier. Any larger `gpn` buckets ranks into
+    `g // gpn` nodes, which is the RDMA tier - the one that is charged separately and is two
+    orders of magnitude slower.
+    """
+    n = g // gpn
     vol = uni = mx = 0.0
     for _ in range(steps):
         lg = rng.standard_normal((B, E)).astype(np.float32)
         if skew:
             lg += skew * np.log(rng.gamma(0.4, 1.0, E) + 1e-6)
-        vis = np.zeros((B, g), bool)
-        np.put_along_axis(vis, sel_rank(lg, K, keep, g) * g // E, True, 1)
+        vis = np.zeros((B, n), bool)
+        np.put_along_axis(vis, sel_rank(lg, K, keep, g) * g // E // gpn, True, 1)
         vol += vis.sum()
         uni += vis.any(0).sum()
         mx += vis.sum(0).max()
@@ -76,15 +82,20 @@ def main():
             print(f"    keep={keep}  ranks (NVLink) {(r / br - 1) * 100:+6.1f}%"
                   f"   nodes (RDMA) {(n / bn - 1) * 100:+6.1f}%")
 
+    # Participation is the one that decides whether anything waits less. The all-to-all is one
+    # collective per layer per step over the whole in-flight batch, so if the union of
+    # destinations is already everything, a smaller payload is all the rule can buy.
     print("\nPer step, keep=8 (control) vs keep=4:")
     for skew, lab in ((0.0, "iid"), (1.0, "skewed")):
-        for g in (4, 8):
-            for B in (16, 256):
-                v8, u8, m8 = step(rng, g, 8, B, skew)
-                v4, u4, m4 = step(rng, g, 4, B, skew)
-                print(f"  {lab:6} ep={g} B={B:<4} volume {(v4 / v8 - 1) * 100:+6.1f}%"
-                      f"   ranks taking part {u8:.2f} -> {u4:.2f}"
-                      f"   busiest rank {(m4 / m8 - 1) * 100:+6.1f}%")
+        for g, gpn, B in ((4, 1, 16), (4, 1, 256), (8, 1, 16), (8, 1, 256),
+                          (8, 2, 256), (16, 2, 256), (16, 1, 256), (32, 2, 256)):
+            v8, u8, m8 = step(rng, g, 8, B, skew, gpn)
+            v4, u4, m4 = step(rng, g, 4, B, skew, gpn)
+            dst = "ranks" if gpn == 1 else f"{g // gpn} nodes"
+            print(f"  {lab:6} ep={g:<2} B={B:<4} over {dst:<8}"
+                  f" volume {(v4 / v8 - 1) * 100:+6.1f}%"
+                  f"   taking part {u8:5.2f} -> {u4:5.2f}"
+                  f"   busiest {(m4 / m8 - 1) * 100:+6.1f}%")
 
 
 if __name__ == "__main__":
