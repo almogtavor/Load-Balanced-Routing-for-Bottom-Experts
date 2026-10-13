@@ -86,10 +86,12 @@ the dispatch payload per all-to-all stayed small however many requests were in f
 that shrinks payload and not per-collective latency cannot show there. `BATCH_TOK` now passes
 the budget explicitly and every artefact records it, and the re-measurement at a real budget
 is in: `q30pf`, 32 requests of 4096 prompt tokens at `--max-num-batched-tokens 8192`, ep=4 on
-one host, three base launches. It did not change the sign. `keep=4` is **-3.16%** and `keep=2`
-**-5.43%** against a base spread of **0.64%** - a tighter instrument than the capped runs ever
-gave, and the loss is now resolved rather than inside the noise. The budget was a real defect
-in the measurement and not the reason the saving does not convert.
+one host, five base launches over two sweeps. It did not change the sign. The arms come out
+monotone - `keep=8` **+0.33%**, `keep=6` **-0.49%**, `keep=4` **-3.16%**, `keep=2` **-5.43%** -
+against a base spread of 0.64% and 0.22% in the two sweeps, which is a tighter instrument than
+the capped runs ever gave. The no-op control costing nothing is what makes the rest of that
+ladder readable: the loss at `keep=4` and below is the routing rule and not the plugin. The
+budget was a real defect in the measurement and not the reason the saving does not convert.
 
 An earlier set of throughput numbers was withdrawn, and the fix for it is why the control arm
 above is clean. vLLM pads a batch for cudagraph and data-parallel capture and marks the padding
@@ -205,7 +207,7 @@ Out-tok/s against that same launch's own base arms, median of the warm repeats
 | Qwen3-30B-A3B | 2 | -3.60% | -2.85% | -3.56% | -0.74% | 1.8-3.8% | +7-8% |
 | Qwen3.5-35B | 2 | -4.15% | -1.66% | -0.70% | -1.60% | 0.6-3.0% | ~0% |
 | Gemma, decode-heavy | 1 | +1.95% | - | +1.65% | +0.62% | 2.7% | +0.7% |
-| Qwen3-30B-A3B, prefill-first, 8192-token steps | 1 (3 bases) | - | - | **-3.16%** | **-5.43%** | **0.64%** | -3.0% |
+| Qwen3-30B-A3B, prefill-first, 8192-token steps | 2 (5 bases) | **+0.33%** | -0.49% | **-3.16%** | **-5.43%** | 0.22-0.64% | -3 to -4% |
 
 Read the no-op column first, because it is the instrument. On Gemma it is +0.22%: the plugin
 costs nothing measurable to run, and the keep arms there are the rule and nothing else. On both
@@ -217,9 +219,12 @@ arms are a single launch whose largest number is the no-op control: noise with a
 
 That leaves two usable rows, and both are negative. Gemma: `keep=6` at -0.62% is inside the
 base spread, `keep=4` at -4.41% and `keep=2` at -5.00% are outside it. `q30pf`, at a real token
-budget and with three base launches agreeing to 0.64%, is the cleanest measurement in this repo
-and says the same thing with a tenth of the noise: -3.16% at `keep=4`, -5.43% at `keep=2`. The
-rule is real here, and it is a slowdown.
+budget and with five base launches agreeing to under 0.64%, is the cleanest measurement in this
+repo and says the same thing with a tenth of the noise. Its no-op is +0.33% and its `keep=6` is
+-0.49%, both inside the spread; `keep=4` at -3.16% and `keep=2` at -5.43% are an order of
+magnitude outside it. So the rule is free as long as it only moves the eighth slot, and it
+costs throughput monotonically in how many slots it moves. There is no arm anywhere in this
+table where it pays.
 
 A launch is the unit of analysis, not a repeat. An unmodified engine loaded twice measured
 +5.4% and +5.9% against itself across launches, so only within-launch ratios against that
