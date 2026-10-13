@@ -93,6 +93,13 @@ spec:
         - {name: KEEPS, value: "${KEEPS}"}
         - {name: STREAM, value: "${STREAM}"}
         - {name: TOKREF, value: "${TOKREF}"}
+        # The load shape. The defaults are prefill-heavy (1024/128 at 256-way), where the
+        # expert GEMMs amortise the all-to-all and a per-token fan-out saving cannot show;
+        # a decode-dominant shape at modest concurrency is where the rule is supposed to pay.
+        - {name: N_REQ, value: "${N_REQ}"}
+        - {name: PROMPT_LEN, value: "${PROMPT_LEN}"}
+        - {name: GEN_LEN, value: "${GEN_LEN}"}
+        - {name: REPEATS, value: "${REPEATS}"}
         # bench.py pulls GPQA's rows from the Hub; the mirror is ungated but an anonymous
         # pull is rate-limited and four jobs start at once.
         - name: HF_TOKEN
