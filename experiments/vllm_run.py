@@ -205,6 +205,10 @@ def main() -> None:
 
     OUT.mkdir(exist_ok=True)
     (OUT / f"vllm_{TAG}_{ARM}.json").write_text(json.dumps({
+        # A result carries no clue which kernel wrote it, and `compare.py` globs arms by
+        # tag - so without this a file left over from a superseded run aggregates
+        # silently beside a fresh one. A missing field fails loudly; a stale number does not.
+        "written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "tag": TAG, "model": MODEL, "arm": ARM, "keep": keep, "n_gpus": N_GPUS,
         "vllm": __import__("vllm").__version__, "a2a": A2A or "<default>",
         "n_req": N_REQ, "prompt_len": PROMPT_LEN, "gen_len": GEN_LEN,
