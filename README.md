@@ -2,7 +2,7 @@
 
 A vLLM plugin that re-routes the bottom of each token's expert selection onto the GPUs the
 token is already being sent to, and the experiments that measure what that costs and buys on
-four MoE families.
+four MoE families - three of them inside vLLM, the fourth offline only.
 
 A token routed to top-8 of a few hundred experts in an expert-parallel deployment usually has
 to be sent to *every* GPU, because eight experts drawn from that many rarely share a device.
@@ -46,22 +46,29 @@ PAR_KEEP=2 vllm serve <model> --tensor-parallel-size 4 --enable-expert-parallel
 
 vLLM v0.31 routes every fused-MoE layer through `BaseRouter._select_experts`, which validates
 EPLB state, delegates to a subclass `_compute_routing`, maps logical expert ids to physical and
-fixes the index dtype. `src/par/plugin.py` wraps that one method: the model's own router
-computes its own top-k, then the Triton kernel in `src/par/kernel.py` rewrites the bottom
-`k - keep` ids and the gate weights are regathered at the new indices. The dispatch, the
-combine, the expert GEMMs and every other routing variant are untouched, which is the only
-reason this is safe to drop into a stock image.
+fixes the index dtype. `src/par/vendor/fused_topk_router.py` is that subclass vendored
+verbatim from v0.31.0 with two imports and four lines changed: the Triton kernel in
+`src/par/kernel.py` *replaces* the fused top-k rather than running after it, so an arm spends
+the one launch per MoE layer stock vLLM also spends. Gemma routes through `CustomRoutingRouter`
+instead, so `src/par/plugin.py` wraps that method and substitutes the kernel for the model's
+own routing function, folding in its per-expert scale. The dispatch, the combine, the expert
+GEMMs and every other routing variant are untouched, which is the only reason this is safe to
+drop into a stock image.
 
 Expert-to-rank needs no map tensor: vLLM shards experts in contiguous blocks, so rank is
 `expert * ep_size // num_experts`, computed in the kernel.
 
-The wrapper **passes the selection through unchanged, with one warning**, wherever the rule's
-premise does not hold: EPLB replication (expert id no longer implies a rank), grouped top-k or
-score-correction bias or zero-expert routing (the ranking is not the gate logits, so "the top
-`keep` by logit" is not the head the router chose), a rank count of 1 (no all-to-all to
-shrink), and a non-divisible or too-small expert block (no substitute is guaranteed to exist).
-A routing rule that silently applied where its premise fails would be measured as free and
-serve garbage.
+The router **passes the selection through unchanged, with one warning**, wherever the rule's
+premise does not hold. `_unsupported` in `src/par/plugin.py` is the whole list: a router class
+or custom routing function that does not rank by gate logits alone (grouped top-k, score
+correction, zero-expert routing - "the top `keep` by logit" would not be the head the router
+chose), a non-softmax `scoring_func` or routing without renormalization (the kernel's softmax
+is scoped to the selection), EPLB replication (expert id no longer implies a rank), `keep >
+top_k`, a logit width that disagrees with the expert count, a rank count of 1 (no all-to-all
+to shrink), a non-divisible or too-small expert block (no substitute is guaranteed to exist),
+and `ep_size > 32` (the kernel tracks the head's ranks in one int32 lane). `keep == top_k` is
+allowed through on purpose: that arm is the control. A routing rule that silently applied
+where its premise fails would be measured as free and serve garbage.
 
 ## What it measures out at
 
@@ -102,7 +109,7 @@ holds `E/G` of the `E` experts, so a top-k drawn without replacement misses it w
 probability `prod_i (E-E/G-i)/(E-i)`, and a token touches `G (1 - p(k))` ranks. The rewrite
 makes a token's rank set its top-`keep`'s rank set, so the same expression at `n = keep` is
 the fan-out afterwards. `expected_fanout` in `src/par/kernel.py` is that formula, asserted
-against the measured fan-out in the self-check and printed by it:
+against the measured fan-out in the self-check:
 
 | `ep_size` | top-8 touches | `keep=6` | `keep=4` | `keep=2` |
 | --- | --- | --- | --- | --- |
@@ -229,9 +236,11 @@ Three things finish the explanation:
 * **The bytes that shrink are on the cheap tier.** DeepEP counts ranks and nodes separately
   (`num_tokens_per_rank` vs `num_tokens_per_rdma_rank`): NVLink is charged per distinct rank,
   RDMA per distinct node. These runs are 2 GPUs per node, so `ep=4` is 2 nodes, where `keep=4`
-  cuts rank fan-out -24.3% and node fan-out only **-5.9%**. Worse, that node saving does not
-  improve with width - it is -5.9% at `ep=4`, `ep=8` and `ep=16` alike, because the top `keep`
-  already reach every node. Everything the rule gains by going wider lands on NVLink.
+  cuts rank fan-out -24.3% and node fan-out only **-5.9%** - top-8 already reaches both nodes,
+  so almost nothing on the expensive tier is left to cut. What governs the node saving is the
+  node count, not EP width: at N nodes it is exactly the rank saving at `ep=N`
+  (`experiments/fanout.py` prints -5.9% at 2 nodes, -24.3% at 4, -37.5% at 8). Widening EP
+  inside the same two hosts puts everything the rule gains on NVLink.
 * **The step was not bandwidth-bound.** vLLM's own log on these runs: `DeepEP: Disabling CUDA
   Graphs since DeepEP high-throughput kernels are optimized for prefill`. A launch-bound step
   does not speed up when a resource that was not the bottleneck gets cheaper.
@@ -269,7 +278,7 @@ across tokens and layers in ways no synthetic draw reproduces.
 
 ## The measurements
 
-Two independent ones, because they fail in different ways.
+Three, because they fail in different ways.
 
 **In vLLM - `experiments/vllm_run.py`, `experiments/compare.py`.** A stock engine, four GPUs,
 expert-parallel, nothing swapped but the router. One process per arm, since `PAR_KEEP` is read
@@ -284,6 +293,14 @@ modelling file - and that file still selects attention from a hard-coded class d
 rejects the `vllm` attention implementation the backend installs. Hunyuan therefore appears in
 the offline sweep only. Making it load would mean rewriting someone's modelling code and then
 measuring that, which is not the same experiment.
+
+**Against a real server - `experiments/serve_run.py`, `experiments/paired.py`.** The offline
+API all-gathers, whose volume is independent of per-token fan-out, so it cannot show this
+saving at all; vLLM 0.31 gates the DeepEP all-to-all on data parallelism, which needs one
+process per rank and therefore a real `vllm serve`. Those runs carry the headline throughput
+table. A launch, not a repeat, is the unit of analysis: an unmodified engine loaded twice
+measured +5.4% and +5.9% against itself, so only paired ratios inside one launch are usable
+and `paired.py` reports nothing else.
 
 **Offline, isolating the all-to-all - `experiments/{accuracy,bench,latency}.py`.** The vLLM
 number is end-to-end, so a real saving in the dispatch shows up diluted by everything else in
@@ -319,6 +336,14 @@ the pair is the point.
 MODEL=/models/qwen3-30b-a3b TAG=q30rh ARMS=base,base2,6,4,2,base3 experiments/run.sh
 python experiments/compare.py
 
+# the DeepEP shape, where the volume this shrinks is the volume the engine moves
+MODEL=/models/qwen3-30b-a3b TAG=q30dp SERVE=1 DP=2 A2A=deepep_high_throughput \
+  ARMS=base,base2,6,4,2,base3 experiments/run.sh
+python experiments/paired.py
+
+# no GPU: which tier the saving lands on, and whether anything on the critical path moves
+python experiments/fanout.py
+
 # the offline sweep: needs a cached token stream at $STREAMS/$STREAM.npy
 MODEL=/models/qwen3-30b-a3b TAG=q30rh experiments/run.sh
 python experiments/plot.py
@@ -352,10 +377,13 @@ hosts, which is the shape where the saving reaches the RDMA tier. Built, not yet
 | `experiments/compare.py` | the vLLM figure and the paired statistics |
 | `experiments/paired.py` | the serve throughput table, paired within each launch |
 | `experiments/accuracy.py` | offline `delta-NLL` per arm, plus the routing traces |
+| `experiments/moe.py` | finding and overriding a router across four families that agree on nothing |
+| `experiments/placement.py` | the rule in torch, plus the analytic fan-out, shared by the offline scripts |
 | `experiments/bench.py` | offline GPQA per arm, McNemar's exact paired test |
 | `experiments/latency.py` | offline expert-parallel MoE layer time under those traces |
 | `experiments/plot.py` | the offline figure |
 | `experiments/serve_run.py` | one arm against a real `vllm serve`, which is the only shape vLLM 0.31 builds the DeepEP all-to-all in |
 | `experiments/fanout.py` | which tier a fan-out saving lands on, and whether per-step participation moves with it |
 | `experiments/hunyuan_capacity.py` | Hunyuan's gate drops tokens past a capacity equal to the mean load; this raises it to the true maximum |
+| `experiments/run.sh` | the in-container driver: self-check, then the arms, then the sweep |
 | `experiments/k8s/` | one Job per model |

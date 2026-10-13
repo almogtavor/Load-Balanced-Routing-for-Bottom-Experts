@@ -1,2 +1,3 @@
-runs/
+runs/*
+!runs/vllm.png
 __pycache__/
