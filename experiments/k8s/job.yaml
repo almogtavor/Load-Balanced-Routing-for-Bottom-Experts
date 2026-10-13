@@ -18,11 +18,35 @@ metadata:
   labels: {app: par, owner: almogtavor}
 spec:
   backoffLimit: 2
+  # `NODES=1` (the default) renders a plain one-pod Job. Above that it is one pod per node,
+  # which is what expert parallelism wider than a node needs: `JOB_COMPLETION_INDEX` is the
+  # pod's data-parallel rank offset, and the anti-affinity is what makes "per node" true -
+  # four pods packed onto one host would be the single-node case under a different name.
+  completions: ${NODES}
+  parallelism: ${NODES}
+  completionMode: Indexed
   template:
     metadata:
-      labels: {app: par, owner: almogtavor}
+      labels: {app: par, owner: almogtavor, job: par-${NAME}}
     spec:
       restartPolicy: Never
+      # Gives each pod the DNS name `par-${NAME}-<index>.par-${NAME}`, which is how the
+      # peers find rank 0 - the Service below publishes it before the pods are ready.
+      subdomain: par-${NAME}
+      affinity:
+        # Two hosts in this cluster have GPUs that are present but unusable - one reports
+        # CUDA error 802 from the fabric manager, the other fails admission with "GPU is
+        # lost". The scheduler packs deterministically and keeps picking them, so every
+        # retry fails identically; `BAD` is the standing exclusion.
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - {key: kubernetes.io/hostname, operator: NotIn, values: [${BAD}]}
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector: {matchLabels: {job: par-${NAME}}}
+            topologyKey: kubernetes.io/hostname
       # Optional `NODE=<hostname>` pin. The packing scheduler is deterministic, so a node whose
       # GPU has fallen off the bus keeps being chosen and every retry fails the same way; the
       # pin is the escape hatch. Empty renders as `{}`, which means "anywhere".
@@ -81,6 +105,9 @@ spec:
         # needs one process per rank. DP splits GPUS, so DP=2 at GPUS=4 is tp=2 with 4-way EP.
         - {name: SERVE, value: "${SERVE}"}
         - {name: DP, value: "${DP}"}
+        # Pods in this Job, i.e. nodes. The engine's dp size is DP * NODES; `HEAD` is rank 0.
+        - {name: NODES, value: "${NODES}"}
+        - {name: HEAD, value: "par-${NAME}-0.par-${NAME}.llm-d-pic.svc.cluster.local"}
         - {name: TFVER, value: "${TFVER}"}
         - {name: MODEL, value: "${MODEL}"}
         - {name: TAG, value: "${TAG}"}
@@ -105,8 +132,10 @@ spec:
         - name: HF_TOKEN
           valueFrom: {secretKeyRef: {name: llm-d-hf-token, key: HF_TOKEN}}
         resources:
-          limits: {cpu: "32", memory: ${MEM}, nvidia.com/gpu: "${GPUS}"}
-          requests: {cpu: "8", memory: ${MEM}, nvidia.com/gpu: "${GPUS}"}
+          # `rdma/roce_gdr` is what DeepEP dispatches over between nodes. Harmless at
+          # NODES=1, where nothing leaves the host.
+          limits: {cpu: "32", memory: ${MEM}, nvidia.com/gpu: "${GPUS}", rdma/roce_gdr: "1"}
+          requests: {cpu: "8", memory: ${MEM}, nvidia.com/gpu: "${GPUS}", rdma/roce_gdr: "1"}
         volumeMounts:
         - {mountPath: /models/qwen_tok, name: q30rh-bf16, readOnly: true}
         - {mountPath: /models/bf16, name: q30rh-bf16, readOnly: true}
@@ -124,3 +153,17 @@ spec:
       - {name: results, persistentVolumeClaim: {claimName: kvcache-bench-results-almogtavor}}
       # NCCL's intra-node transports need shared memory well beyond the default 64 MB.
       - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}
+---
+# Headless, and publishing addresses before readiness: the peers resolve rank 0 while every
+# pod is still booting, so a Service that waited for readiness would deadlock the Job.
+apiVersion: v1
+kind: Service
+metadata:
+  name: par-${NAME}
+  namespace: llm-d-pic
+  labels: {app: par, owner: almogtavor}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {job: par-${NAME}}
+  ports: [{name: rpc, port: 5555}]

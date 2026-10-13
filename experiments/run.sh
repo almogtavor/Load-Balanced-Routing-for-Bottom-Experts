@@ -29,11 +29,33 @@ if [ -n "${ARMS:-}" ]; then
   # whatever drifts between launches lands on all arms rather than on whichever ran first.
   # REP0 offsets the index so a second job can add sweeps to a tag already measured
   # instead of overwriting its files.
+  # Multi-node expert parallelism is one pod per node (an indexed Job), and only rank 0
+  # benchmarks. The peers hold expert shards and route their own tokens, so they need the
+  # arm's PAR_KEEP too - the head publishes it to the shared PVC before each arm. A peer's
+  # engine dies when the head kills its own between arms, which is the restart signal.
+  mkdir -p runs
+  sent="runs/mn_${TAG}.arm"
+  if [ "${JOB_COMPLETION_INDEX:-0}" != "0" ]; then
+    while :; do
+      arm="$(cat "${sent}" 2>/dev/null || echo wait)"
+      case "${arm}" in
+        done) exit 0 ;;
+        wait) sleep 5; continue ;;
+      esac
+      ARM="${arm}" "${PY}" experiments/serve_run.py || true
+      sleep 5
+    done
+  fi
+  [ "${NODES:-1}" = "1" ] || echo wait > "${sent}"
   for rep in $(seq "${REP0:-0}" $(( ${REP0:-0} + ${REPS:-1} - 1 ))); do
     for arm in ${ARMS//,/ }; do
+      # Published first, then a pause: the peers still running the previous arm have to see
+      # their engine go away and come back on this one before the head waits for /health.
+      [ "${NODES:-1}" = "1" ] || { echo "${arm}" > "${sent}"; sleep 30; }
       REP="${rep}" ARM="${arm}" "${PY}" "${script}"
     done
   done
+  [ "${NODES:-1}" = "1" ] || echo done > "${sent}"
   exit 0
 fi
 

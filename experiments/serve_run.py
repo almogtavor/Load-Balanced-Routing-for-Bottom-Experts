@@ -43,6 +43,15 @@ ARM = os.environ.get("ARM", "base")                   # base* | an integer `keep
 REP = os.environ.get("REP", "0")                      # which sweep; a launch is the unit
 N_GPUS = int(os.environ.get("GPUS", 4))
 DP = int(os.environ.get("DP", 2))
+# Expert parallelism spread over more than one node. DeepEP charges NVLink per distinct rank
+# but RDMA per distinct *node*, and inside a single node the top `keep` experts alone already
+# reach every node there is - so the fan-out the rule removes is all intra-node, and the
+# expensive tier barely moves. Only once the node count exceeds `keep` can the tail be
+# confined, which needs one pod per node: an indexed Job, rank 0 driving, the rest headless.
+NODES = int(os.environ.get("NODES", 1))
+RANK = int(os.environ.get("JOB_COMPLETION_INDEX", 0))
+HEAD = os.environ.get("HEAD", "127.0.0.1")
+RPC_PORT = int(os.environ.get("RPC_PORT", 5555))
 # `or`, not a `get` default: the job template exports every knob it knows about, so an
 # unset `A2A` arrives as the empty string and would reach vLLM as an invalid choice.
 A2A = os.environ.get("A2A") or "deepep_high_throughput"
@@ -60,14 +69,36 @@ OUT = pathlib.Path("runs")
 assert N_GPUS % DP == 0, f"GPUS={N_GPUS} not divisible by DP={DP}"
 
 
-def serve() -> subprocess.Popen:
-    """Start the server and block until it answers `/health`, or raise with its last output."""
+def cmdline() -> list[str]:
+    """The engine command. `DP` is per pod, so the engine's dp size is `DP * NODES` and the
+    expert-parallel world is the whole Job - every rank of it, head and peers alike."""
     cmd = ["vllm", "serve", MODEL, "--port", str(PORT),
-           "--data-parallel-size", str(DP), "--tensor-parallel-size", str(N_GPUS // DP),
+           "--data-parallel-size", str(DP * NODES),
+           "--data-parallel-size-local", str(DP),
+           "--tensor-parallel-size", str(N_GPUS // DP),
            "--enable-expert-parallel", "--all2all-backend", A2A,
            "--trust-remote-code", "--max-model-len", str(MAX_LEN), "--seed", "0",
            "--no-enable-prefix-caching", "--disable-log-stats",
            "--gpu-memory-utilization", os.environ.get("GPU_UTIL", "0.90")]
+    if NODES > 1:
+        cmd += ["--data-parallel-address", HEAD, "--data-parallel-rpc-port", str(RPC_PORT)]
+        if RANK:
+            cmd += ["--headless", "--data-parallel-start-rank", str(RANK * DP)]
+    return cmd
+
+
+def peer() -> None:
+    """A non-head pod. Holds its expert shards and routes its own tokens - so it needs the
+    same `PAR_KEEP` - but measures nothing. Exits when the head kills its engine between
+    arms, and `run.sh` restarts it for the next one."""
+    cmd = cmdline()
+    print("[peer] " + " ".join(cmd), flush=True)
+    raise SystemExit(subprocess.call(cmd))
+
+
+def serve() -> subprocess.Popen:
+    """Start the server and block until it answers `/health`, or raise with its last output."""
+    cmd = cmdline()
     print("[serve] " + " ".join(cmd), flush=True)
     # Its own process group, so one kill reaches the data-parallel children too.
     p = subprocess.Popen(cmd, start_new_session=True)
@@ -125,7 +156,10 @@ def main() -> None:
     else:
         os.environ["PAR_KEEP"] = str(keep)
     print(f"[{TAG}/{ARM}] PAR_KEEP={os.environ.get('PAR_KEEP', '<unset>')} gpus={N_GPUS} "
-          f"dp={DP} tp={N_GPUS // DP} a2a={A2A}", flush=True)
+          f"dp={DP * NODES} (local {DP}) tp={N_GPUS // DP} nodes={NODES} rank={RANK} "
+          f"a2a={A2A}", flush=True)
+    if RANK:
+        peer()
 
     # Fixed token ids rather than text, with the same seed as `vllm_run.py`: the batch has to
     # be identical across arms, and a prompt that tokenizes differently would not be.
@@ -147,7 +181,8 @@ def main() -> None:
         "rep": int(REP),
         "written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "tag": TAG, "model": MODEL, "arm": ARM, "keep": keep, "n_gpus": N_GPUS,
-        "vllm": __import__("vllm").__version__, "a2a": A2A, "dp": DP, "tp": N_GPUS // DP,
+        "vllm": __import__("vllm").__version__, "a2a": A2A, "dp": DP * NODES, "tp": N_GPUS // DP,
+        "nodes": NODES, "ep_size": DP * NODES,
         "n_req": N_REQ, "prompt_len": PROMPT_LEN, "gen_len": GEN_LEN,
         "throughput": tp, "warm_tok_per_s": warm,
         "out_tok_per_s": float(np.median(warm)),
