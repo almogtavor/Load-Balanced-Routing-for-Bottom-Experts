@@ -68,18 +68,23 @@ SOURCE = os.environ.get("GPQA", "ankner/gpqa")
 SPLIT = os.environ.get("GPQA_SPLIT", "train")
 
 
-def fetch_rows() -> list[dict]:
-    """Every row of `SOURCE`, over the dataset-server API. 100 rows is its per-request cap."""
+def fetch_rows(source: str = SOURCE, config: str = "default", split: str = SPLIT,
+               cap: int = 0) -> list[dict]:
+    """Rows of a Hub dataset, over the dataset-server API. 100 rows is its per-request cap.
+
+    `cap` stops early, which is what a caller that only needs a few hundred thousand
+    characters of text wants; 0 means every row.
+    """
     tok = os.environ.get("HF_TOKEN")
     head = {"Authorization": f"Bearer {tok}"} if tok else {}
     rows: list[dict] = []
     while True:
         u = (f"https://datasets-server.huggingface.co/rows"
-             f"?dataset={urllib.parse.quote(SOURCE, safe='')}&config=default"
-             f"&split={SPLIT}&offset={len(rows)}&length=100")
+             f"?dataset={urllib.parse.quote(source, safe='')}&config={config}"
+             f"&split={split}&offset={len(rows)}&length=100")
         d = json.load(urllib.request.urlopen(urllib.request.Request(u, headers=head), timeout=120))
         rows += [r["row"] for r in d["rows"]]
-        if len(rows) >= d["num_rows_total"]:
+        if len(rows) >= d["num_rows_total"] or (cap and len(rows) >= cap):
             return rows
 
 

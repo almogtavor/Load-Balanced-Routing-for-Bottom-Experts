@@ -22,6 +22,13 @@ hence one script per arm and `compare.py` to pair them up. Two things make the p
 The accuracy phase scores GPQA by option likelihood through `prompt_logprobs`, item for item
 and normalized by option length exactly as `bench.py` does it, so the two are comparable and
 `compare.py` can run the same exact McNemar test on the result.
+
+The language-modelling phase scores held-out wikitext-2 through that same `prompt_logprobs`
+and reports mean NLL per window - a corpus fetched over the Hub API rather than the offline
+sweep's locally cached stream, so this runs wherever the image runs. It is the engine's own
+answer to the question the offline sweep answers with an HF forward pass: does the rewritten
+routing change what the model predicts. Paired by window index across arms, so the difference carries
+a standard error rather than two means to eyeball.
 """
 
 from __future__ import annotations
@@ -57,6 +64,12 @@ REPEATS = int(os.environ.get("REPEATS", 6))
 # refuses to run in one process, and prefill-context parallelism has no attention backend in
 # 0.31 - so it is measured against a real server in `serve_run.py`.
 A2A = os.environ.get("A2A", "")
+# The language-modelling phase: `N_WIN` windows of held-out natural text, each one token short
+# of `MAX_LEN` because `prompt_logprobs` needs room for the one token `max_tokens=1` samples.
+N_WIN = int(os.environ.get("NWIN", 32))
+LM_SOURCE = os.environ.get("LM_SOURCE", "Salesforce/wikitext")
+LM_CONFIG = os.environ.get("LM_CONFIG", "wikitext-2-raw-v1")
+LM_SPLIT = os.environ.get("LM_SPLIT", "test")
 OUT = pathlib.Path("runs")
 
 
@@ -105,6 +118,39 @@ def gpqa(llm) -> np.ndarray:
     return s.argmax(1) == np.array([g for _, _, g in items])
 
 
+def nll(llm) -> list[float]:
+    """`[N_WIN]` mean NLL over positions `1..L-1` of each window of held-out text.
+
+    `prompt_logprobs=0` returns, for each prompt token, the log-prob the model gave it in
+    context, which is exactly the negative of the cross-entropy `accuracy.py` computes through
+    an HF forward pass - so this is that same quantity, read out of the serving engine with
+    the kernel in the loop. Position 0 has no log-prob because nothing predicts it.
+
+    Wikitext-2 rather than the offline sweep's cached token stream: the stream is a local
+    artefact and this has to run wherever the image runs, and a corpus that is not also the
+    accuracy phase's corpus keeps the two measurements from sharing a sample. Windows are
+    paired by index across arms, so the arm difference is a paired difference.
+    """
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    import bench
+
+    seq = MAX_LEN - 1
+    # A wikitext row is ~300 characters, so ~75 tokens; ask for twice the windows' worth and
+    # stop there rather than pulling all 4358 rows in 44 requests an arm. The assert below is
+    # what catches a corpus that turns out shorter than this arithmetic assumes.
+    rows = bench.fetch_rows(LM_SOURCE, LM_CONFIG, LM_SPLIT, cap=N_WIN * seq // 50)
+    text = "".join(r["text"] for r in rows)
+    ids = llm.get_tokenizer()(text, add_special_tokens=False).input_ids
+    assert len(ids) >= N_WIN * seq, f"{LM_SOURCE} gave {len(ids)} tokens, need {N_WIN * seq}"
+    win = np.asarray(ids[: N_WIN * seq]).reshape(N_WIN, seq)
+    outs = llm.generate([TokensPrompt(prompt_token_ids=w.tolist()) for w in win],
+                        SamplingParams(temperature=0, max_tokens=1, prompt_logprobs=0))
+    return [-float(np.mean([next(iter(d.values())).logprob for d in o.prompt_logprobs[1:]]))
+            for o in outs]
+
+
 def throughput(llm) -> list[dict]:
     """Wall-clock for a fixed amount of decode work, repeated. Identical batch in every arm."""
     from vllm import SamplingParams
@@ -144,6 +190,8 @@ def main() -> None:
     llm = engine()
     hit = gpqa(llm)
     print(f"[{TAG}/{ARM}] gpqa acc={hit.mean():.4f} n={len(hit)}", flush=True)
+    pw = nll(llm)
+    print(f"[{TAG}/{ARM}] nll={np.mean(pw):.5f} over {len(pw)} windows", flush=True)
     tp = throughput(llm)
     warm = [r["out_tok_per_s"] for r in tp[1:]] or [tp[0]["out_tok_per_s"]]
 
@@ -153,6 +201,10 @@ def main() -> None:
         "vllm": __import__("vllm").__version__, "a2a": A2A or "<default>",
         "n_req": N_REQ, "prompt_len": PROMPT_LEN, "gen_len": GEN_LEN,
         "gpqa_acc": float(hit.mean()), "gpqa_hit": hit.astype(int).tolist(),
+        # Per window, not just the mean: the arm gap is a paired difference and needs the
+        # pairing kept. `compare.py` reads this list.
+        "nll": float(np.mean(pw)), "nll_per_window": pw, "n_win": len(pw),
+        "lm_source": f"{LM_SOURCE}/{LM_CONFIG}/{LM_SPLIT}",
         "throughput": tp,
         # Warm repeats only, median: the first pays for CUDA graph capture and the Triton
         # autotune, which is a real cost but not the one being compared. `compare.py` reads

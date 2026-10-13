@@ -63,6 +63,62 @@ shrink), and a non-divisible or too-small expert block (no substitute is guarant
 A routing rule that silently applied where its premise fails would be measured as free and
 serve garbage.
 
+## What it measures out at
+
+In a stock vLLM 0.31 engine, four GPUs, expert-parallel, the rule **costs throughput and does
+not pay for it**. Decode throughput vs. the unmodified engine, mean of five warm repeats, with
+the paired GPQA delta on the same 198 items:
+
+| | `base2` (repeat) | `keep=6` | `keep=4` | `keep=2` |
+| --- | --- | --- | --- | --- |
+| Qwen3-30B-A3B | +0.70% | -6.34% | -9.09% | -14.51% |
+| Qwen3.5-35B | +0.38% | -8.03% | -7.09% | -10.23% |
+| Gemma-4-26B-A4B | +0.24% | -42.80% | -45.58% | -43.20% |
+| paired dacc, worst arm | - | -4.04 (p=0.27) | -0.51 (p=1.00) | -7.58 (p=0.008) |
+
+Every throughput delta clears the repeat baseline (`p=0.008`, the exact permutation floor at
+five repeats an arm); only one accuracy cell resolves at all, and it is `keep=2` on Qwen3.5.
+
+The reason is the dispatch. vLLM 0.31 defaults to `allgather_reducescatter`, which gathers
+every token onto every rank: the volume it moves does not depend on per-token GPU fan-out, so
+there is nothing here for this rule to shrink and its extra work is pure cost. The two cost
+shapes are visible in the table. On the Qwen models the loss grows monotonically as `keep`
+falls, which is the cost of rewriting more ids. On Gemma it is flat and five times larger,
+because Gemma-4 routes through a custom Python routing function rather than a fused top-k, and
+the exactness-preserving hook runs that function a second time per MoE layer - a cost paid per
+layer whatever `keep` is.
+
+### The backend where the saving exists
+
+`allgather_reducescatter` has nothing to save, so the test that matters is DeepEP, whose
+dispatch volume *is* per-token fan-out. vLLM 0.31 only builds it under data parallelism, which
+needs one process per rank - so this arm runs through a real `vllm serve`
+(`experiments/serve_run.py`, the `dp` tags). It does not pay there either:
+
+| | `base2` (repeat) | `keep=6` | `keep=4` | `keep=2` | instrument |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3-30B-A3B | +12.46% | +3.16% | -1.43% | +5.11% | ±2-2.5%, baseline shifted +12% |
+| Qwen3.5-35B | +3.78% | -4.04% | -6.04% | -4.14% | ±0.3-0.7% |
+| Gemma-4-26B-A4B | -1.16% | -3.22% | -5.21% | -2.85% | ±2.9-3.8% |
+
+Read the `base2` column first. On Qwen3-30B the stock engine, loaded and measured a second
+time, is **12.5% faster than itself** at `p=0.008` - ten times the allgather band - so that row
+resolves nothing and the three keep arms scattered around zero are noise, not a result. Gemma's
+repeats drift monotonically downward inside every engine load (2949 → 2540 out-tok/s across
+five warm repeats), a clock or neighbour effect, and no arm there resolves either.
+
+Qwen3.5 is the one serve row with a usable instrument, and it is negative: every keep arm loses
+4-6% against its own base and 8-10 points against the repeat. That is the honest answer to the
+question the offline microbenchmark raised - the dispatch saving is real (+8-9% on the
+all-to-all alone, measured in isolation) and smaller than what the rewrite costs around it.
+
+One confound to state rather than hide: DeepEP HT with `data_parallel_size > 1` disables CUDA
+graphs (`vllm/config/compilation.py`), which is why serve-mode absolute throughput is ~2.4K
+out-tok/s against ~9K offline. It applies to every arm equally, so the comparison is fair - but
+this kernel's cost is per-layer Python work, and the one backend where its saving exists is
+also the backend that cannot graph that work away. A fused implementation of the rewrite, or a
+DeepEP path that keeps CUDA graphs, is the experiment that could still move this.
+
 ## The measurements
 
 Two independent ones, because they fail in different ways.
@@ -125,9 +181,14 @@ On OpenShift, one Job per model (`ARMS` switches a job to the vLLM path):
 ```bash
 experiments/k8s/launch.sh NAME=q30 TAG=q30rh MODEL=/models/bf16      ARMS=base,base2,6,4,2
 experiments/k8s/launch.sh NAME=q35 TAG=q35   MODEL=/models/q35_bf16  ARMS=base,base2,6,4,2
-experiments/k8s/launch.sh NAME=hy  TAG=hy13b MODEL=/models/hy_bf16   ARMS=base,base2,6,4,2
 experiments/k8s/launch.sh NAME=gm  TAG=gm26b MODEL=/models/gm_bf16   ARMS=base,base2,6,4,2
+# Hunyuan has no vLLM arm - see "The measurements" - so it runs the offline sweep only:
+experiments/k8s/launch.sh NAME=hy  TAG=hy13b MODEL=/models/hy_bf16   TF4=1 BATCH=1
 ```
+
+`SERVE=1 DP=2 A2A=deepep_high_throughput` runs the same arms against a real `vllm serve` on the
+DeepEP dispatch instead of the offline API. Give those runs their own `TAG`; the backend is a
+measurement condition, not an implementation detail.
 
 ## Files
 

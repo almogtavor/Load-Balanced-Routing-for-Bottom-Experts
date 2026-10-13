@@ -101,6 +101,14 @@ def rows(tag: str) -> list[dict]:
         ab, ar = acc["base"], acc[name]
         assert len(ar["gpqa_hit"]) == len(ab["gpqa_hit"]), f"{tag}/{name}: item count moved"
         m = bench.mcnemar(np.array(ab["gpqa_hit"], bool), np.array(ar["gpqa_hit"], bool))
+        # Language modelling, paired by window index. Same source as the accuracy: what the
+        # model predicts is the router's business, not the dispatch backend's. `nan` for runs
+        # written before this phase existed.
+        if "nll_per_window" in ar and "nll_per_window" in ab:
+            d = np.array(ar["nll_per_window"]) - np.array(ab["nll_per_window"])
+            dnll, dnll_se = float(d.mean()), float(d.std(ddof=1) / np.sqrt(len(d)))
+        else:
+            dnll = dnll_se = float("nan")
         wa, wb = warm(r), warm(base)
         # Ratio of means with the delta method, so the error bar on the figure is the error on
         # the quantity actually plotted rather than on either arm alone.
@@ -113,6 +121,7 @@ def rows(tag: str) -> list[dict]:
                     "n_rep": len(wa),
                     "tok_s": wa.mean(), "base_tok_s": wb.mean(),
                     "dacc": 100 * m["dacc"], "p": m["p_mcnemar"], "sig": m["resolved"],
+                    "dnll": dnll, "dnll_se": dnll_se,
                     "n_disc": m["n_discordant"]})
     # `base2` first, then the keeps from the mildest down, so the table reads as a sweep.
     return sorted(out, key=lambda r: (r["keep"] is not None, -(r["keep"] or 0)))
@@ -135,6 +144,7 @@ def main() -> None:
             print(f"  {r['arm']:>5}  {r['tok_s']:8.1f} tok/s  "
                   f"{r['up']:+6.2f}%+-{r['up_se']:.2f}  p_tput={r['p_tp']:.3f}   "
                   f"dacc {r['dacc']:+6.2f}  p_acc={r['p']:.3f}  discordant={r['n_disc']}"
+                  f"   dnll {r['dnll']:+.5f}+-{r['dnll_se']:.5f}"
                   f"{'  ACC-RESOLVED' if r['sig'] else ''}")
         for r in rs:
             if r["keep"] is None:
