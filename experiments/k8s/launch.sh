@@ -51,6 +51,7 @@ set -euo pipefail
 : "${BATCH:=4}" ; : "${NWIN:=32}" ; : "${KEEPS:=6,4,2}"
 : "${STREAM:=multilingual}" ; : "${TOKREF:=/models/qwen_tok}" ; : "${NODE:=}"
 : "${N_REQ:=256}" ; : "${PROMPT_LEN:=1024}" ; : "${GEN_LEN:=128}" ; : "${REPEATS:=6}"
+: "${BATCH_TOK:=0}"   # 0 = serve_run picks max(MAX_LEN, 2048); vLLM's own DP default is 256
 : "${NODES:=1}" ; : "${BAD:=pokprod-b93r43s1, pokprod-b93r38s0}"
 : "${ARMS:=}" ; : "${IMG:=v0.31.0}" ; : "${A2A:=}" ; : "${SERVE:=0}" ; : "${DP:=2}" ; : "${REPS:=1}" ; : "${REP0:=0}"
 # Which cluster. The defaults are the OpenShift one, whose template carries its namespace and
@@ -67,9 +68,9 @@ for kv in "$@"; do export "${kv?}"; done
 NODE="${NODE:+kubernetes.io/hostname: ${NODE}}"
 export NAME TAG MODEL GPUS MEM TF4 TFVER BATCH NWIN KEEPS STREAM TOKREF NODE ARMS IMG A2A SERVE DP REPS REP0
 export NODES BAD NS CLAIM
-export N_REQ PROMPT_LEN GEN_LEN REPEATS
+export N_REQ PROMPT_LEN GEN_LEN REPEATS BATCH_TOK
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ${KCTL} delete job "par-${NAME}" --ignore-not-found >/dev/null
-envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $ARMS $IMG $A2A $SERVE $DP $REPS $REP0 $N_REQ $PROMPT_LEN $GEN_LEN $REPEATS $NODES $BAD $NS $CLAIM' \
+envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $ARMS $IMG $A2A $SERVE $DP $REPS $REP0 $N_REQ $PROMPT_LEN $GEN_LEN $REPEATS $BATCH_TOK $NODES $BAD $NS $CLAIM' \
   < "${here}/${TPL}" | ${KCTL} apply -f -
-echo "launched par-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} tf4=${TF4} arms=${ARMS:-offline} a2a=${A2A:-default} serve=${SERVE} dp=${DP} reps=${REPS} rep0=${REP0} shape=${N_REQ}x${PROMPT_LEN}/${GEN_LEN} nodes=${NODES} ep=$(( DP * NODES ))"
+echo "launched par-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} tf4=${TF4} arms=${ARMS:-offline} a2a=${A2A:-default} serve=${SERVE} dp=${DP} reps=${REPS} rep0=${REP0} shape=${N_REQ}x${PROMPT_LEN}/${GEN_LEN} btok=${BATCH_TOK} nodes=${NODES} ep=$(( DP * NODES ))"

@@ -126,6 +126,11 @@ spec:
         - {name: N_REQ, value: "${N_REQ}"}
         - {name: PROMPT_LEN, value: "${PROMPT_LEN}"}
         - {name: GEN_LEN, value: "${GEN_LEN}"}
+        # The scheduler's per-step token budget, which is the dispatch payload per
+        # all-to-all. Under data parallelism vLLM defaults it to 256, not 2048, so without
+        # this every long prompt arrived as 256-token chunks and `V` stayed small however
+        # many requests were in flight. It is a measurement condition, so it is passed.
+        - {name: BATCH_TOK, value: "${BATCH_TOK}"}
         - {name: REPEATS, value: "${REPEATS}"}
         # bench.py pulls GPQA's rows from the Hub; the mirror is ungated but an anonymous
         # pull is rate-limited and four jobs start at once.

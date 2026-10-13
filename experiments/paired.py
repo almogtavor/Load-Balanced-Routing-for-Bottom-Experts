@@ -52,7 +52,7 @@ def main():
     print(f"excluded {skipped} artefacts written before the kernel fix ({CUT})")
     print(f"metric: {METRIC}")
     per_tag = collections.defaultdict(lambda: collections.defaultdict(list))
-    print(f"{'tag':8} {'rep':>3} {'nb':>2} {'base':>8} {'spread%':>7} "
+    print(f"{'tag':8} {'btok':>5} {'rep':>3} {'nb':>2} {'base':>8} {'spread%':>7} "
           + " ".join(f"{'k=' + k:>8}" for k in KEEPS) + "  decay%")
     for (tag, rep), arms in sorted(runs.items()):
         bases = [v[METRIC] for a, v in arms.items()
@@ -60,23 +60,30 @@ def main():
         if not bases:
             continue
         bm = st.mean(bases)
+        # The scheduler's per-step token budget is the dispatch payload per all-to-all, so a
+        # tag measured at two budgets is two different experiments. It keys the aggregate
+        # rather than being averaged into it. Artefacts from before the knob existed ran at
+        # vLLM's batched-DP default of 256.
+        bts = {v.get("batch_tok", 256) for v in arms.values()}
+        assert len(bts) == 1, f"{tag} r{rep} mixes token budgets {bts}"
+        bt = bts.pop()
         row = []
         for k in KEEPS:
             if arms.get(k, {}).get(METRIC) is None:
                 row.append(f"{'-':>8}")
                 continue
             r = (arms[k][METRIC] / bm - 1) * 100
-            per_tag[tag][k].append(r)
+            per_tag[(tag, bt)][k].append(r)
             row.append(f"{r:+8.2f}")
         dec = st.mean([decay(v) for a, v in arms.items() if a.startswith("base")])
-        print(f"{tag:8} {rep:>3} {len(bases):>2} {bm:>8.1f} "
+        print(f"{tag:8} {bt:>5} {rep:>3} {len(bases):>2} {bm:>8.1f} "
               f"{(max(bases) - min(bases)) / bm * 100:>7.2f} " + " ".join(row) + f"  {dec:+6.1f}")
 
     print("\nacross launches (mean of the per-launch ratios, n launches):")
-    for tag in sorted(per_tag):
-        cells = (f"k={k} " + (f"{st.mean(v):+7.2f} (n={len(v)})" if (v := per_tag[tag][k])
+    for key in sorted(per_tag):
+        cells = (f"k={k} " + (f"{st.mean(v):+7.2f} (n={len(v)})" if (v := per_tag[key][k])
                               else f"{'-':>13}") for k in KEEPS)
-        print(f"  {tag:8} " + " ".join(cells))
+        print(f"  {key[0]:8} btok={key[1]:<5} " + " ".join(cells))
 
 
 if __name__ == "__main__":

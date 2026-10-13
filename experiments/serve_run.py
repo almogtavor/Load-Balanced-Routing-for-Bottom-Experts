@@ -61,6 +61,14 @@ GEN_LEN = int(os.environ.get("GEN_LEN", 128))
 # Derived, so a prefill-heavy shape does not also need its own context knob passed to the
 # job template: a prompt longer than the context window is rejected, not truncated.
 MAX_LEN = int(os.environ.get("MAX_LEN") or 0) or PROMPT_LEN + GEN_LEN + 8
+# The scheduler's token budget per step, which *is* the dispatch payload per all-to-all. Under
+# data parallelism vLLM defaults it to 256, not the usual 2048
+# (`DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP`, applied in arg_utils.py when the flag is
+# unset), so every earlier run here chunked a long prompt into 256-token steps: `V` per
+# collective was pinned small however many requests were in flight, which is exactly the
+# `L`-dominated regime where a rule that only shrinks `V` cannot show. It is a measurement
+# condition, so it is set explicitly rather than inherited, and recorded in the artefact.
+BATCH_TOK = int(os.environ.get("BATCH_TOK") or 0) or max(MAX_LEN, 2048)
 REPEATS = int(os.environ.get("REPEATS", 6))
 PORT = int(os.environ.get("PORT", 8077))
 # Engine load with DeepEP buffers and no CUDA graphs is slow, and a job that silently waits
@@ -80,6 +88,7 @@ def cmdline() -> list[str]:
            "--tensor-parallel-size", str(N_GPUS // DP),
            "--enable-expert-parallel", "--all2all-backend", A2A,
            "--trust-remote-code", "--max-model-len", str(MAX_LEN), "--seed", "0",
+           "--max-num-batched-tokens", str(BATCH_TOK),
            "--no-enable-prefix-caching", "--disable-log-stats",
            "--gpu-memory-utilization", os.environ.get("GPU_UTIL", "0.90")]
     if NODES > 1:
@@ -213,6 +222,7 @@ def main() -> None:
         "vllm": __import__("vllm").__version__, "a2a": A2A, "dp": DP * NODES, "tp": N_GPUS // DP,
         "nodes": NODES, "ep_size": DP * NODES,
         "n_req": N_REQ, "prompt_len": PROMPT_LEN, "gen_len": GEN_LEN,
+        "batch_tok": BATCH_TOK, "max_len": MAX_LEN,
         "throughput": tp, "warm_tok_per_s": [r["out_tok_per_s"] for r in warm],
         "out_tok_per_s": med("out_tok_per_s"),
         # Prefill is `PROMPT_LEN / GEN_LEN` times the token volume of decode but only enters
