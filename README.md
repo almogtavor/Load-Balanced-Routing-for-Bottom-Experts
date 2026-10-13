@@ -65,28 +65,30 @@ serve garbage.
 
 ## What it measures out at
 
-**The throughput numbers are withdrawn and being re-measured.** The arms that produced them
-ran a kernel that mishandled vLLM's padded rows, and the mishandling fell on the rule's side
-of the comparison only, so the cost it reported is an upper bound on the real one and not an
-estimate of it.
+Three results, and they separate cleanly. **The plugin is free to run**: `keep = top_k` asks
+for no substitution, and across two engine loads it comes out at +0.22% throughput. **The rule
+costs real accuracy** below `keep=6`, resolved at 3 sigma on both Qwen families. **Nothing is
+faster, anywhere measured** - every arm lands between 0 and -5%, and
+[why a smaller payload is not a faster step](#why-a-smaller-payload-is-not-a-faster-step) is
+what the evidence says about that.
 
-vLLM pads a batch for cudagraph and data-parallel capture and marks the padding by forcing
-those tokens' expert ids to `-1`, so the dispatch and the experts drop them
+An earlier set of throughput numbers was withdrawn, and the fix for it is why the control arm
+above is clean. vLLM pads a batch for cudagraph and data-parallel capture and marks the padding
+by forcing those tokens' expert ids to `-1`, so the dispatch and the experts drop them
 (`VLLM_MOE_SKIP_PADDING`, on by default since 0.31). A `-1` is not a selection, and the first
 kernel treated it as one: its `argmax` ran over an all-`-inf` block, fewer than `top_k` output
 slots got written, and the row came out holding whatever `torch.empty` had left there. Real
-expert ids, for tokens the unmodified engine never dispatches. The baseline arms skipped that
-padding and the rule's arms paid full dispatch and expert GEMM for it - at decode batch sizes,
-where padding is a large fraction of the captured batch, that is most of a measurement.
-
-It also explains the one failure that was not a quiet bias: a `-1` reaching Gemma's index
-scatter asserted out of bounds mid-run (`ScatterGatherKernel.cu:203`).
+expert ids, for tokens the unmodified engine never dispatches - so the baseline arms skipped
+that padding and the rule's arms paid full dispatch and expert GEMM for it, which at decode
+batch sizes is most of a measurement. It also explains the one failure that was not a quiet
+bias: a `-1` reaching Gemma's index scatter asserted out of bounds mid-run
+(`ScatterGatherKernel.cu:203`).
 
 The kernel now declines any row that is not `top_k` distinct in-range experts and returns it
 byte-for-byte, sentinel included; `src/par/kernel.py` asserts that on GPU before any arm runs.
-The structural claim below is unaffected - it is a property of the dispatch, not of the rule's
-per-layer cost - and so are the quality numbers: vLLM's fused MoE imposes no expert capacity,
-so a padded token routed by mistake costs time and takes nothing from a real token's output.
+That moved the no-op control from about -9% to +0.22%. The quality numbers were never affected
+- vLLM's fused MoE imposes no expert capacity, so a padded token routed by mistake costs time
+and takes nothing from a real token's output.
 
 The reason there is nothing on the other side of it is the dispatch. vLLM 0.31 defaults to
 `allgather_reducescatter`, which gathers every token onto every rank: the volume it moves does
@@ -166,31 +168,87 @@ ceiling, not evidence the other arms are free:
 `allgather_reducescatter` has nothing to save, so the test that matters is DeepEP, whose
 dispatch volume *is* per-token fan-out. vLLM 0.31 only builds it under data parallelism, which
 needs one process per rank - so this arm runs through a real `vllm serve`
-(`experiments/serve_run.py`, the `dp` tags). It does not pay there either:
+(`experiments/serve_run.py`, the `dp` tags). Four GPUs, `dp=2 tp=2`, so `ep_size=4`;
+`deepep_high_throughput`; 256 requests at 1024 prompt / 128 generated, except `gmdec`, which is
+a decode-dominant 16 at 128/512.
 
-| | `base2` (repeat) | `keep=6` | `keep=4` | `keep=2` | instrument |
-| --- | --- | --- | --- | --- | --- |
-| Qwen3-30B-A3B | +12.46% | +3.16% | -1.43% | +5.11% | ±2-2.5%, baseline shifted +12% |
-| Qwen3.5-35B | +3.78% | -4.04% | -6.04% | -4.14% | ±0.3-0.7% |
-| Gemma-4-26B-A4B | -1.16% | -3.22% | -5.21% | -2.85% | ±2.9-3.8% |
+Out-tok/s against that same launch's own base arms, median of the warm repeats
+(`experiments/paired.py`):
 
-Read the `base2` column first. On Qwen3-30B the stock engine, loaded and measured a second
-time, is **12.5% faster than itself** at `p=0.008` - ten times the allgather band - so that row
-resolves nothing and the three keep arms scattered around zero are noise, not a result. Gemma's
-repeats drift monotonically downward inside every engine load (2949 → 2540 out-tok/s across
-five warm repeats), a clock or neighbour effect, and no arm there resolves either.
+| | launches | `keep=8` (no-op) | `keep=6` | `keep=4` | `keep=2` | base spread | decay |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Gemma-4-26B-A4B | 2 | **+0.22%** | -0.62% | **-4.41%** | **-5.00%** | 2.3-3.5% | ~0% |
+| Qwen3-30B-A3B | 2 | -3.60% | -2.85% | -3.56% | -0.74% | 1.8-3.8% | +7-8% |
+| Qwen3.5-35B | 2 | -4.15% | -1.66% | -0.70% | -1.60% | 0.6-3.0% | ~0% |
+| Gemma, decode-heavy | 1 | +1.95% | - | +1.65% | +0.62% | 2.7% | +0.7% |
 
-Qwen3.5 is the one serve row with a usable instrument, and it is negative: every keep arm loses
-4-6% against its own base and 8-10 points against the repeat. That is the honest answer to the
-question the offline microbenchmark raised - the dispatch saving is real (+8-9% on the
-all-to-all alone, measured in isolation) and smaller than what the rewrite costs around it.
+Read the no-op column first, because it is the instrument. On Gemma it is +0.22%: the plugin
+costs nothing measurable to run, and the keep arms there are the rule and nothing else. On both
+Qwen rows it is *more negative than the keep arms*, which is incoherent - a control that asks
+for no substitution cannot cost more than substituting - so those two rows resolve nothing.
+`q30dp` also decays +7-8% from first warm repeat to last **on its own unmodified base**, which
+puts its resolution floor above every effect in the table. And the decode-heavy row's positive
+arms are a single launch whose largest number is the no-op control: noise with a sign.
 
-One confound to state rather than hide: DeepEP HT with `data_parallel_size > 1` disables CUDA
-graphs (`vllm/config/compilation.py`), which is why serve-mode absolute throughput is ~2.4K
-out-tok/s against ~9K offline. It applies to every arm equally, so the comparison is fair - but
-this kernel's cost is per-layer Python work, and the one backend where its saving exists is
-also the backend that cannot graph that work away. A fused implementation of the rewrite, or a
-DeepEP path that keeps CUDA graphs, is the experiment that could still move this.
+That leaves one usable row, and it is negative: `keep=6` at -0.62% is inside the base spread,
+`keep=4` at -4.41% and `keep=2` at -5.00% are outside it. The rule is real here, and it is a
+slowdown.
+
+A launch is the unit of analysis, not a repeat. An unmodified engine loaded twice measured
++5.4% and +5.9% against itself across launches, so only within-launch ratios against that
+launch's own base arms are used, repeat 0 is discarded as cold, and the within-launch decay is
+reported next to every row as what that row can resolve.
+
+### Why a smaller payload is not a faster step
+
+The rule looks like it does two things: moves fewer bytes, and makes a token wait on fewer
+GPUs. The first is true. The second is not, and `experiments/fanout.py` is what separates them.
+Three quantities decide a step, and the rule moves two of them:
+
+| per step, `keep=4` vs `keep=8` | `ep=4`, B=256 | `ep=8`, B=256 |
+| --- | --- | --- |
+| volume on the wire | -24.1% | -37.4% |
+| ranks taking part in the collective | 4.00 -> 4.00 | 8.00 -> 8.00 |
+| busiest rank's share | -22.4% | -34.8% |
+
+The middle row is the answer. The all-to-all is **one collective per layer per step over the
+whole in-flight batch**, not one per token. Even 16 tokens at top-8 reach every rank with
+near-certainty, so the union of ranks is the full world size at every `keep` and no rank is
+ever dropped from the collective. The payload shrinks; the participation does not, and the
+fixed per-collective cost - launch, handshake, sync - is paid in full either way. There is no
+"waiting for fewer GPUs" to collect, at any `keep`.
+
+This also refutes the opposite worry, which is worth stating because it was ours: substitutes
+are drawn from ranks the head already visits, so one would expect traffic to pile onto hot
+ranks and eat the saving. It does not. The busiest rank's load falls -11% to -35%, under a
+gamma-skewed router as well as iid. Both the volume and the critical-path proxy improve, and
+still nothing is faster.
+
+Three things finish the explanation:
+
+* **The bytes that shrink are on the cheap tier.** DeepEP counts ranks and nodes separately
+  (`num_tokens_per_rank` vs `num_tokens_per_rdma_rank`): NVLink is charged per distinct rank,
+  RDMA per distinct node. These runs are 2 GPUs per node, so `ep=4` is 2 nodes, where `keep=4`
+  cuts rank fan-out -24.3% and node fan-out only **-5.9%**. Worse, that node saving does not
+  improve with width - it is -5.9% at `ep=4`, `ep=8` and `ep=16` alike, because the top `keep`
+  already reach every node. Everything the rule gains by going wider lands on NVLink.
+* **The step was not bandwidth-bound.** vLLM's own log on these runs: `DeepEP: Disabling CUDA
+  Graphs since DeepEP high-throughput kernels are optimized for prefill`. A launch-bound step
+  does not speed up when a resource that was not the bottleneck gets cheaper.
+* **Compute is untouched by construction.** The rule changes *which* rank holds a token's
+  expert, never how many experts it has, so the `sum_t k` expert-token GEMM pairs are identical
+  in every arm. Nothing is removed from the only part of the step that scales with the model.
+
+The regime that would test the rule properly is `nodes > keep`, where the top `keep` can no
+longer reach every node and the tail can actually be confined. `experiments/fanout.py` at 1 GPU
+per node puts `keep=4` at **-37.5%** on the RDMA tier at 8 nodes, against -5.9% at 2.
+**That shape was built and never measured** - `NODES=` in `launch.sh` renders one pod per node
+with `rdma/roce_gdr`, and the job was killed before it wrote an artefact. It is an open
+question, not a refuted one, and it is the one experiment that could still turn this around.
+
+Everything from `experiments/fanout.py` is an iid (optionally gamma-skewed) Gaussian logit
+model. It tests the **mechanism, not the magnitude**: a trained router's logits correlate
+across tokens and layers in ways no synthetic draw reproduces.
 
 ## The measurements
 
@@ -263,6 +321,9 @@ experiments/k8s/launch.sh NAME=hy  TAG=hy13b MODEL=/models/hy_bf16   TF4=1 BATCH
 DeepEP dispatch instead of the offline API. Give those runs their own `TAG`; the backend is a
 measurement condition, not an implementation detail.
 
+`NODES=4 GPUS=2 DP=2` renders one pod per node for an `ep_size = DP * NODES` run spread across
+hosts, which is the shape where the saving reaches the RDMA tier. Built, not yet measured.
+
 ## Files
 
 | | |
@@ -272,9 +333,12 @@ measurement condition, not an implementation detail.
 | `docker/`, `helm/` | the stock serving image with the router swapped, and a chart for it |
 | `experiments/vllm_run.py` | one arm in real vLLM: GPQA and decode throughput |
 | `experiments/compare.py` | the vLLM figure and the paired statistics |
+| `experiments/paired.py` | the serve throughput table, paired within each launch |
 | `experiments/accuracy.py` | offline `delta-NLL` per arm, plus the routing traces |
 | `experiments/bench.py` | offline GPQA per arm, McNemar's exact paired test |
 | `experiments/latency.py` | offline expert-parallel MoE layer time under those traces |
 | `experiments/plot.py` | the offline figure |
+| `experiments/serve_run.py` | one arm against a real `vllm serve`, which is the only shape vLLM 0.31 builds the DeepEP all-to-all in |
+| `experiments/fanout.py` | which tier a fan-out saving lands on, and whether per-step participation moves with it |
 | `experiments/hunyuan_capacity.py` | Hunyuan's gate drops tokens past a capacity equal to the mean load; this raises it to the true maximum |
 | `experiments/k8s/` | one Job per model |
