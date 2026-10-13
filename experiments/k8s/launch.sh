@@ -33,7 +33,13 @@
 #   KCTL='kubectl --context=waldorf_US-EAST-04A -n almogtavor-dev' TPL=job-cw.yaml \
 #     NS=almogtavor-dev CLAIM=par-cw BAD=gd91fda ./launch.sh NAME=q30mn TAG=q30mn \
 #     MODEL=/results/models/q30 NODES=4 GPUS=1 DP=1 MEM=200Gi \
-#     SERVE=1 A2A=deepep_high_throughput ARMS=base,base2,4,base3
+#     SERVE=1 A2A=nixl_ep ARMS=base,base2,4,base3
+#
+# `nixl_ep`, not `deepep_high_throughput`, at one GPU per node: DeepEP computes `nvl_rank =
+# rank % 8` and `rdma_rank = rank / 8` unconditionally, so its only legal shapes are one node
+# with ep <= 8 or several nodes with exactly 8 GPUs each. One GPU per node asserts in HT and
+# dies in `cudaIpcOpenMemHandle` in LL. `nixl_ep` has the same dispatch contract and no such
+# constraint, which makes it the only backend that runs this shape.
 #
 # `BAD` is per-cluster, so pass it: the default names the two unusable OpenShift hosts. Four
 # arms rather than six because only `keep=4` has a predicted RDMA saving at ep=4, and three
@@ -46,6 +52,7 @@ set -euo pipefail
 : "${STREAM:=multilingual}" ; : "${TOKREF:=/models/qwen_tok}" ; : "${NODE:=}"
 : "${N_REQ:=256}" ; : "${PROMPT_LEN:=1024}" ; : "${GEN_LEN:=128}" ; : "${REPEATS:=6}"
 : "${NODES:=1}" ; : "${BAD:=pokprod-b93r43s1, pokprod-b93r38s0}"
+: "${IBDEV:=ibp0}"
 : "${ARMS:=}" ; : "${IMG:=v0.31.0}" ; : "${A2A:=}" ; : "${SERVE:=0}" ; : "${DP:=2}" ; : "${REPS:=1}" ; : "${REP0:=0}"
 # Which cluster. The defaults are the OpenShift one, whose template carries its namespace and
 # model PVCs as literals; `TPL=job-cw.yaml` is the CoreWeave multi-node shape, which takes
@@ -64,6 +71,6 @@ export NODES BAD NS CLAIM
 export N_REQ PROMPT_LEN GEN_LEN REPEATS
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ${KCTL} delete job "par-${NAME}" --ignore-not-found >/dev/null
-envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $ARMS $IMG $A2A $SERVE $DP $REPS $REP0 $N_REQ $PROMPT_LEN $GEN_LEN $REPEATS $NODES $BAD $NS $CLAIM' \
+envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $ARMS $IMG $A2A $SERVE $DP $REPS $REP0 $N_REQ $PROMPT_LEN $GEN_LEN $REPEATS $NODES $BAD $IBDEV $NS $CLAIM' \
   < "${here}/${TPL}" | ${KCTL} apply -f -
 echo "launched par-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} tf4=${TF4} arms=${ARMS:-offline} a2a=${A2A:-default} serve=${SERVE} dp=${DP} reps=${REPS} rep0=${REP0} shape=${N_REQ}x${PROMPT_LEN}/${GEN_LEN} nodes=${NODES} ep=$(( DP * NODES ))"

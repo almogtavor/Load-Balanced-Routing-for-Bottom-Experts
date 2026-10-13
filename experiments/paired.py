@@ -5,7 +5,9 @@ An unmodified engine, loaded twice on the same node for the same workload, measu
 own launch*, repeat 0 is discarded as cold upstream, and the within-launch decay of the base
 arms is printed beside every row as the floor on what that row can resolve.
 
-    python3 experiments/paired.py        # reads runs/serve_*.json
+    python3 experiments/paired.py                      # decode rate, runs/serve_*.json
+    METRIC=tot_tok_per_s python3 experiments/paired.py  # prefill+decode rate
+    METRIC=ib_b_per_tok python3 experiments/paired.py   # IB bytes per token, lower is better
 """
 import collections
 import glob
@@ -20,6 +22,10 @@ import statistics as st
 CUT = "2026-10-13T10:40"
 
 KEEPS = ["8", "6", "4", "2", "1"]
+# The rule moves communication volume, which is `ib_b_per_tok` directly and
+# `tot_tok_per_s` at a prefill-heavy shape. On the bytes metric a negative row is the
+# rule working; on the rate metrics a positive one is.
+METRIC = os.environ.get("METRIC") or "out_tok_per_s"
 
 
 def load(pat="runs/serve_*.json"):
@@ -44,20 +50,22 @@ def decay(d):
 def main():
     runs, skipped = load()
     print(f"excluded {skipped} artefacts written before the kernel fix ({CUT})")
+    print(f"metric: {METRIC}")
     per_tag = collections.defaultdict(lambda: collections.defaultdict(list))
     print(f"{'tag':8} {'rep':>3} {'nb':>2} {'base':>8} {'spread%':>7} "
           + " ".join(f"{'k=' + k:>8}" for k in KEEPS) + "  decay%")
     for (tag, rep), arms in sorted(runs.items()):
-        bases = [v["out_tok_per_s"] for a, v in arms.items() if a.startswith("base")]
+        bases = [v[METRIC] for a, v in arms.items()
+                 if a.startswith("base") and v.get(METRIC) is not None]
         if not bases:
             continue
         bm = st.mean(bases)
         row = []
         for k in KEEPS:
-            if k not in arms:
+            if arms.get(k, {}).get(METRIC) is None:
                 row.append(f"{'-':>8}")
                 continue
-            r = (arms[k]["out_tok_per_s"] / bm - 1) * 100
+            r = (arms[k][METRIC] / bm - 1) * 100
             per_tag[tag][k].append(r)
             row.append(f"{r:+8.2f}")
         dec = st.mean([decay(v) for a, v in arms.items() if a.startswith("base")])

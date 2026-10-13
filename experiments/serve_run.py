@@ -55,10 +55,12 @@ RPC_PORT = int(os.environ.get("RPC_PORT", 5555))
 # `or`, not a `get` default: the job template exports every knob it knows about, so an
 # unset `A2A` arrives as the empty string and would reach vLLM as an invalid choice.
 A2A = os.environ.get("A2A") or "deepep_high_throughput"
-MAX_LEN = int(os.environ.get("MAX_LEN", 2048))
 N_REQ = int(os.environ.get("N_REQ", 256))
 PROMPT_LEN = int(os.environ.get("PROMPT_LEN", 1024))
 GEN_LEN = int(os.environ.get("GEN_LEN", 128))
+# Derived, so a prefill-heavy shape does not also need its own context knob passed to the
+# job template: a prompt longer than the context window is rejected, not truncated.
+MAX_LEN = int(os.environ.get("MAX_LEN") or 0) or PROMPT_LEN + GEN_LEN + 8
 REPEATS = int(os.environ.get("REPEATS", 6))
 PORT = int(os.environ.get("PORT", 8077))
 # Engine load with DeepEP buffers and no CUDA graphs is slow, and a job that silently waits
@@ -134,18 +136,42 @@ def post(prompt: list[int]) -> int:
         return json.load(r)["usage"]["completion_tokens"]
 
 
+# Every other number in this file is a time, and a time also moves when a launch is slow -
+# which is exactly the confound the keep==top_k control arm exists to absorb. These counters
+# are the one direct read of the quantity the routing rule actually changes. `port_xmit_data`
+# counts octets/4 per the IB spec, and is per *host*, so it includes the engine's own NCCL
+# traffic - the comparison that means anything is arm against arm within one launch.
+IB = sorted(pathlib.Path("/sys/class/infiniband").glob("*/ports/1/counters/port_xmit_data"))
+
+
+def ib_bytes() -> int:
+    """Bytes transmitted across every IB port this pod can see, or 0 where there are none."""
+    tot = 0
+    for c in IB:
+        try:
+            tot += int(c.read_text()) * 4
+        except (OSError, ValueError):
+            pass
+    return tot
+
+
 def throughput(prompts: list[list[int]]) -> list[dict]:
-    """Wall-clock for a fixed amount of decode work, all requests in flight at once."""
+    """Wall-clock and bytes for a fixed amount of work, all requests in flight at once."""
     out = []
     with cf.ThreadPoolExecutor(max_workers=N_REQ) as ex:
         for r in range(REPEATS):
-            t0 = time.perf_counter()
+            b0, t0 = ib_bytes(), time.perf_counter()
             n_out = sum(ex.map(post, prompts))
-            dt = time.perf_counter() - t0
+            dt, db = time.perf_counter() - t0, ib_bytes() - b0
             assert n_out == N_REQ * GEN_LEN, f"decoded {n_out}, expected {N_REQ * GEN_LEN}"
+            n_tot = n_out + N_REQ * PROMPT_LEN
             out.append({"repeat": r, "seconds": dt, "out_tok_per_s": n_out / dt,
-                        "tot_tok_per_s": (n_out + N_REQ * PROMPT_LEN) / dt})
-            print(f"  [{ARM}] repeat {r}: {dt:.2f}s  {n_out / dt:.1f} out-tok/s", flush=True)
+                        "tot_tok_per_s": n_tot / dt,
+                        # The 32-bit counters wrap; a negative delta is a wrap, not a saving.
+                        "ib_gb": db / 1e9 if db >= 0 else None,
+                        "ib_b_per_tok": db / n_tot if db >= 0 else None})
+            print(f"  [{ARM}] repeat {r}: {dt:.2f}s  {n_out / dt:.1f} out-tok/s  "
+                  f"{n_tot / dt:.0f} tot-tok/s  {db / 1e9:.2f} GB IB", flush=True)
     return out
 
 
@@ -171,7 +197,10 @@ def main() -> None:
         tp = throughput(prompts)
     finally:
         kill(p)
-    warm = [r["out_tok_per_s"] for r in tp[1:]] or [tp[0]["out_tok_per_s"]]
+    # Repeat 0 pays for CUDA graph capture and the first all-to-all handshake, which is a
+    # launch cost, not a routing one.
+    warm = tp[1:] or tp[:1]
+    med = lambda k: float(np.median(v)) if (v := [r[k] for r in warm if r[k] is not None]) else None
 
     OUT.mkdir(exist_ok=True)
     (OUT / f"serve_{TAG}_{ARM}_r{REP}.json").write_text(json.dumps({
@@ -184,8 +213,14 @@ def main() -> None:
         "vllm": __import__("vllm").__version__, "a2a": A2A, "dp": DP * NODES, "tp": N_GPUS // DP,
         "nodes": NODES, "ep_size": DP * NODES,
         "n_req": N_REQ, "prompt_len": PROMPT_LEN, "gen_len": GEN_LEN,
-        "throughput": tp, "warm_tok_per_s": warm,
-        "out_tok_per_s": float(np.median(warm)),
+        "throughput": tp, "warm_tok_per_s": [r["out_tok_per_s"] for r in warm],
+        "out_tok_per_s": med("out_tok_per_s"),
+        # Prefill is `PROMPT_LEN / GEN_LEN` times the token volume of decode but only enters
+        # `out_tok_per_s` through the denominator, and prefill is where the dispatch payload
+        # is large enough for `V / B_eff` to outweigh the fixed `L` - so at a prefill-heavy
+        # shape this, not the decode rate, is the number the rule is predicted to move.
+        "tot_tok_per_s": med("tot_tok_per_s"),
+        "ib_b_per_tok": med("ib_b_per_tok"),
     }, indent=1) + "\n")
     print(f"WROTE {OUT}/serve_{TAG}_{ARM}_r{REP}.json", flush=True)
 
