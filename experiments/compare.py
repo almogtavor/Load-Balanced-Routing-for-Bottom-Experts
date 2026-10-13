@@ -51,14 +51,19 @@ import bench  # noqa: E402
 # all-to-all backend only changes how the tokens then move. Same model, same rule, same items,
 # same selection - so the accuracy is the same measurement, and running it twice would only add
 # a second sample of GPQA noise.
-ACC_FROM = {"q30dp": "q30rh", "q35dp": "q35", "gmdp": "gm26b"}
-TAGS = os.environ.get("TAGS", "q30rh,q35,gm26b,q30dp,q35dp,gmdp").split(",")
+ACC_FROM = {"q30dp": "q30rh", "q35dp": "q35", "gmdp": "gm26b",
+            "q30dp8": "q30rh", "gmdp8": "gm26b"}
+TAGS = os.environ.get("TAGS", "q30rh,q35,gm26b,q30dp,q35dp,gmdp,q30dp8,gmdp8").split(",")
 LABEL = {"q30rh": "Qwen3-30B-A3B, allgather", "q35": "Qwen3.5-35B, allgather",
          "hy13b": "Hunyuan-A13B", "gm26b": "Gemma-4-26B-A4B, allgather",
          "q30dp": "Qwen3-30B-A3B, DeepEP", "q35dp": "Qwen3.5-35B, DeepEP",
-         "gmdp": "Gemma-4-26B-A4B, DeepEP"}
+         "gmdp": "Gemma-4-26B-A4B, DeepEP",
+         # The width the rule is actually aimed at: at 4 ranks a token already reaches
+         # almost all of them, so `keep` has nearly nothing to cut (see `expected_fanout`).
+         "q30dp8": "Qwen3-30B-A3B, DeepEP ep=8", "gmdp8": "Gemma-4-26B-A4B, DeepEP ep=8"}
 COLOR = {"q30rh": "#aec7e8", "q35": "#ff9896", "hy13b": "#2ca02c", "gm26b": "#c5b0d5",
-         "q30dp": "#1f77b4", "q35dp": "#d62728", "gmdp": "#9467bd"}
+         "q30dp": "#1f77b4", "q35dp": "#d62728", "gmdp": "#9467bd",
+         "q30dp8": "#17becf", "gmdp8": "#8c564b"}
 RUNS = pathlib.Path("runs")
 OUT = RUNS / "vllm.png"
 

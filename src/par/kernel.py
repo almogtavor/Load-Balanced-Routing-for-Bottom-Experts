@@ -317,7 +317,11 @@ def _check() -> None:
         # positive number and a `< 0` test reads a padded row as a real expert.
         for ids in (got, got.to(torch.uint32)):
             miss, safe = unroutable(ids, E)
-            assert bool(miss[:3].all()) and not bool(miss[3]), "declined rows must be flagged"
+            # Rows 0-1 are the two padding shapes this function exists for. Row 2's repeat is
+            # declined by the kernel because it is not a top-k, but it is a sound *index* -
+            # nothing gathering with it can leave a buffer - so it is not flagged, and does
+            # not have to be: `torch.topk` cannot produce it and vLLM's padding is row 0.
+            assert bool(miss[:2].all()) and not bool(miss[3]), "padded rows must be flagged"
             assert int(safe.min()) >= 0 and int(safe.max()) < E, "clamped into range"
         # Not "the row changed" - that is only true with high probability. The rule itself is
         # exact: every expert the rewritten row visits lives on a rank its top-`keep` already

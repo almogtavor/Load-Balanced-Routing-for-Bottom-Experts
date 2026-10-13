@@ -1,4 +1,4 @@
-# One Job per model: both phases, four GPUs, one container. Substitute and apply through
+# One Job per model: both phases, `GPUS` GPUs, one container. Substitute and apply through
 # `launch.sh`, which is the only intended entrypoint.
 #
 # Only the four BF16 checkpoints this experiment uses are mounted. `/results` carries the
