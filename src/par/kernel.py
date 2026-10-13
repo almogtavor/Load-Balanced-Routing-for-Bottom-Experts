@@ -11,13 +11,22 @@ collapses to `|ranks of the top keep|` and every destination stays one the token
 paying for. The premise that the bottom ranks of a top-k selection are substitutable is
 published; `experiments/` is what measures the price on real checkpoints.
 
+The kernel returns the gate weights with the selection, not just the ids. That is not a
+convenience: the alternative is to hand the rewritten ids back to the router and let it weight
+them, which costs a `[T, E]` mask and a second full routing pass per MoE layer per forward -
+work that a serving loop pays on every token and that CUDA graphs cannot remove under DeepEP
+with data parallelism, because that combination disables them. One program already has the
+token's whole logit row resident, so the renormalized softmax over the new selection is one
+reduction on registers.
+
 Two implementations, and the torch one is the specification:
 
 * `rewrite_torch` is the readable reference, and the shape the experiment harness used: it
   builds `[T, E]` boolean temporaries, which is fine for an offline sweep and wasteful in a
   serving loop (~20 MB of traffic and several launches per MoE layer at T=16k, E=256).
 * `rewrite_triton` is one program per token with no `[T, E]` temporary at all: `k` register-
-  resident argmax passes over an `E`-wide block. It is the one that runs under vLLM.
+  resident argmax passes over an `E`-wide block, then the softmax over what they picked. It is
+  the one that runs under vLLM.
 
 Both take the selection *as it came out of the router* and never assume it is sorted by score,
 so they are correct on any top-k implementation whose output is the global top-k.
@@ -82,7 +91,7 @@ def rewrite_torch(logits: torch.Tensor, topk_ids: torch.Tensor, keep: int,
 if triton is not None:
 
     @triton.jit
-    def _par_rewrite(logits_ptr, ids_ptr, out_ptr, stride_lm, E,
+    def _par_rewrite(logits_ptr, ids_ptr, out_ptr, w_ptr, stride_lm, E,
                      K: tl.constexpr, KEEP: tl.constexpr, N_RANKS: tl.constexpr,
                      BLOCK_E: tl.constexpr):
         m = tl.program_id(0)
@@ -98,40 +107,60 @@ if triton is not None:
             cur = cur | (offs == tl.load(ids_ptr + m * K + i).to(tl.int32))
 
         taken = offs < 0
+        slot = offs * 0
         hot = 0
         # The head, recovered in descending-score order by `KEEP` argmax passes over the
-        # incoming selection. Each pass also records the rank it forces a visit to.
+        # incoming selection. Each pass also records the rank it forces a visit to, and the
+        # output slot its winner owns - nothing is written out until both loops are done, so
+        # the whole selection stays in registers and the weights below can see it.
         for i in range(KEEP):
             e = tl.argmax(tl.where(cur & ~taken, z, -float("inf")), axis=0)
             taken = taken | (offs == e)
+            slot = tl.where(offs == e, i, slot)
             hot = hot | (1 << (e * N_RANKS // E))
-            tl.store(out_ptr + m * K + i, e)
 
         on_hot = ((hot >> rank) & 1) == 1
         for i in range(K - KEEP):
             e = tl.argmax(tl.where(on_hot & ~taken, z, -float("inf")), axis=0)
             taken = taken | (offs == e)
-            tl.store(out_ptr + m * K + KEEP + i, e)
+            slot = tl.where(offs == e, KEEP + i, slot)
+
+        # The gate weights of the new selection, from the row still in registers. With
+        # renormalization an expert's weight is the softmax over the selection alone, so the
+        # `E - K` other lanes contribute nothing and this is one max and one sum: they sit at
+        # -inf and exponentiate to zero, which is why they can be summed over regardless.
+        zt = tl.where(taken, z, -float("inf"))
+        p = tl.exp(zt - tl.max(zt, axis=0))
+        # Exactly `K` lanes are taken and they hold distinct slots, so these two masked
+        # scatters write each output position once.
+        tl.store(out_ptr + m * K + slot, offs, mask=taken)
+        tl.store(w_ptr + m * K + slot, p / tl.sum(p, axis=0), mask=taken)
 
 
 def rewrite_triton(logits: torch.Tensor, topk_ids: torch.Tensor, keep: int,
-                   n_ranks: int) -> torch.Tensor:
-    """One program per token, no `[T, E]` temporary. Same contract as `rewrite_torch`."""
+                   n_ranks: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """One program per token, no `[T, E]` temporary. Returns `(ids, gate weights)`."""
     t, e = logits.shape
     k = topk_ids.shape[1]
     out = torch.empty_like(topk_ids, dtype=torch.int32)
-    _par_rewrite[(t,)](logits, topk_ids.to(torch.int32).contiguous(), out, logits.stride(0), e,
-                       K=k, KEEP=keep, N_RANKS=n_ranks,
+    w = torch.empty(t, k, dtype=torch.float32, device=logits.device)
+    _par_rewrite[(t,)](logits, topk_ids.to(torch.int32).contiguous(), out, w, logits.stride(0),
+                       e, K=k, KEEP=keep, N_RANKS=n_ranks,
                        BLOCK_E=triton.next_power_of_2(e), num_warps=4)
-    return out.to(topk_ids.dtype)
+    return out.to(topk_ids.dtype), w
 
 
 def rewrite(logits: torch.Tensor, topk_ids: torch.Tensor, keep: int,
-            n_ranks: int) -> torch.Tensor:
-    """`rewrite_triton` where it can run, the reference everywhere else."""
+            n_ranks: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """`rewrite_triton` where it can run, the reference everywhere else.
+
+    `(ids, weights)`, because a caller that has to weight the selection itself is a caller
+    paying for a second routing pass - see the module docstring.
+    """
     if triton is not None and logits.is_cuda:
         return rewrite_triton(logits.contiguous(), topk_ids, keep, n_ranks)
-    return rewrite_torch(logits, topk_ids, keep, n_ranks)
+    ids = rewrite_torch(logits, topk_ids, keep, n_ranks)
+    return ids, gate_weights(logits, ids, renormalize=True)
 
 
 def gate_weights(logits: torch.Tensor, topk_ids: torch.Tensor,
@@ -175,7 +204,7 @@ def _check() -> None:
             # A router hands its picks over in whatever order its top-k produced, so the
             # rewrite is checked on a shuffled selection too.
             perm = bb.gather(1, torch.rand(T, K, device=dev).argsort(-1))
-            got = rewrite(zz, perm, keep, G)
+            got, gw = rewrite(zz, perm, keep, G)
             ref = rewrite_torch(zz, bb, keep, G)
             assert torch.equal(got.sort(-1).values, ref.sort(-1).values), f"{dev} keep={keep}"
             # Exactly `K` distinct experts, and the head survives: the cost being measured has
@@ -188,13 +217,20 @@ def _check() -> None:
             # or every other arm is measuring the rewrite's own perturbation.
             if keep == K:
                 assert torch.equal(got.sort(-1).values, bb.sort(-1).values), "no-op"
+            # The weights the kernel emitted alongside the ids are the whole reason it can
+            # replace a second routing pass, so they are checked against the reference on the
+            # ids it actually returned - not on the reference's, which may order them
+            # differently. float32 softmax in registers vs. torch's, hence 1e-6.
+            assert torch.allclose(gw, gate_weights(zz, got, renormalize=True), atol=1e-6), \
+                f"{dev} keep={keep} weights"
         ids = rewrite_torch(z, base, keep, G)
         w = gate_weights(z, ids, renormalize=True)
         assert torch.allclose(w.sum(-1), torch.ones(T), atol=1e-5)
-        # The plugin does not use `gate_weights` on a real router: it masks every unselected
-        # expert to the dtype floor and lets the router weight the selection itself. That is
+        # Gemma keeps its own gate: the plugin masks every unselected expert to the dtype
+        # floor and lets the model's routing function weight the selection itself. That is
         # only exact because renormalizing over the selection divides out the softmax
-        # denominator the mask changed, which is the identity asserted here.
+        # denominator the mask changed, which is the identity asserted here - the same one
+        # that lets the kernel emit the weights directly for every other router.
         masked = torch.full_like(z, torch.finfo(z.dtype).min).scatter_(1, ids.long(),
                                                                       z.gather(1, ids.long()))
         assert torch.allclose(masked.softmax(-1).gather(1, ids.long()), w, atol=1e-6)

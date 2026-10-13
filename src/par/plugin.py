@@ -1,17 +1,22 @@
-"""Swapping vLLM's MoE routing for the placement-aware one, in place.
+"""Installing the placement-aware router into a stock vLLM, in place.
 
 vLLM v0.31 routes through a small class hierarchy: `BaseRouter._select_experts` validates the
 EPLB state, delegates to a subclass `_compute_routing`, maps logical expert ids to physical
 ones and fixes the index dtype. Every fused-MoE layer in the engine goes through it.
 
-So this plugin wraps that one method rather than reimplementing any of it: the model's own
-router computes its own top-k, the wrapper rewrites the bottom `k - keep` ids to experts on
-ranks the head already visits (`par.kernel`), and the router then computes the gate weights
-for that selection itself. The expert GEMMs, the dispatch, the combine and every other
-routing variant are untouched, which is the only reason this is safe to drop into a stock
-image.
+Nearly every MoE model served by vLLM routes through `FusedTopKRouter`, and for those this
+plugin swaps in `par.vendor.fused_topk_router` - that same unit copied in with a three-line
+insert, so the rewrite happens inside the routing unit and emits its own gate weights. One
+Triton launch per MoE layer, and nothing else added to the forward.
 
-`PAR_KEEP` turns it on; unset, nothing is patched at all. The wrapper also passes the
+`Gemma4Router` is the exception. It routes through `CustomRoutingRouter`, whose routing
+function lives in the model file and folds a learned per-expert output scale into its gate
+weights, so neither the unit nor the weights can be reproduced here. Gemma keeps the slower
+but exact route: rewrite the ids, then hand the selection back to the router's own routing
+function as logits with every other expert at the dtype floor. That costs a `[T, E]` mask and
+a second routing pass per layer, which is the price of not reimplementing someone's gate.
+
+`PAR_KEEP` turns the whole thing on; unset, nothing is patched at all. Either path passes the
 selection through unchanged, once with a warning, wherever the rule does not apply:
 
 * **EPLB** replicates experts across ranks, so expert id no longer implies a rank and the
@@ -24,7 +29,7 @@ selection through unchanged, once with a warning, wherever the rule does not app
 * **a rank count of 1** has no all-to-all to shrink, and a non-divisible or too-small expert
   block breaks the guarantee that a hot rank always has a substitute left to offer.
 
-Passing through is the right failure: a routing rule that silently applies where its premise
+Passing through is the right failure: a routing rule that silently applied where its premise
 does not hold would be measured as free and serve garbage.
 """
 
@@ -36,18 +41,64 @@ import torch
 
 from par.kernel import rewrite
 
+_KEEP: int | None = None
+_EP: int | None = None
+_MISS = object()
 _warned: set[str] = set()
 
 
-def _warn(logger, why: str) -> None:
-    _once(logger, why, "par: routing left unchanged - %s" % why, logger.warning)
+def _logger():
+    from vllm.logger import init_logger
+
+    return init_logger("par")
 
 
-def _once(logger, key: str, msg: str, how=None) -> None:
-    """Log `msg` the first time `key` is seen. Called per forward, so it has to be cheap."""
+def _warn(why: str) -> None:
+    _once(why, "par: routing left unchanged - %s" % why, warn=True)
+
+
+def _once(key: str, msg: str, warn: bool = False) -> None:
     if key not in _warned:
         _warned.add(key)
-        (how or logger.info)(msg)
+        log = _logger()
+        (log.warning if warn else log.info)(msg)
+
+
+def ep_size() -> int:
+    """The expert-parallel world size. Fixed for the engine's life, so read once."""
+    global _EP
+    if _EP is None:
+        from vllm.distributed.parallel_state import get_ep_group
+
+        _EP = get_ep_group().world_size
+    return _EP
+
+
+def par_keep(router, router_logits) -> int | None:
+    """`keep` if the rule applies to this router, `None` if it does not.
+
+    Called from inside the routing unit, so per MoE layer per forward. Nothing `_unsupported`
+    looks at can change between forwards - top_k, renormalize, the EPLB state, the logit width
+    and the rank count are all fixed once the engine is up - so the answer is decided on the
+    first forward and cached on the router. After that this is one dict lookup.
+    """
+    k = router.__dict__.get("_par_keep", _MISS)
+    if k is not _MISS:
+        return k
+    k = _KEEP
+    if k is not None:
+        why = _unsupported(router, router_logits, k)
+        if why is not None:
+            _warn(why)
+            k = None
+        else:
+            # At warning level on purpose: this is the one line that says the kernel is
+            # actually running, and `logger.info` is below the root logger's level in a stock
+            # vLLM image, so an info-level version of it is invisible exactly where it matters.
+            _once("active", "par: placement-aware routing active, keep=%d of top_k=%d, "
+                            "ep_size=%d" % (k, router.top_k, ep_size()), warn=True)
+    router._par_keep = k
+    return k
 
 
 def _shim_remote_code() -> None:
@@ -66,62 +117,59 @@ def _shim_remote_code() -> None:
 
 def register() -> None:
     """vLLM `general_plugins` entry point. Idempotent, and a no-op without `PAR_KEEP`."""
+    global _KEEP
     _shim_remote_code()
-    keep = os.environ.get("PAR_KEEP")
-    if keep is None:
+    if os.environ.get("PAR_KEEP") is None:
         return
-    keep = int(keep)
 
-    from vllm.logger import init_logger
     from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
     from vllm.model_executor.layers.fused_moe.router.fused_topk_router import FusedTopKRouter
 
-    logger = init_logger("par")
+    from par.vendor.fused_topk_router import FusedTopKRouter as ParFusedTopKRouter
+
     if getattr(BaseRouter, "_par_patched", False):
         return
-    inner = BaseRouter._select_experts
+    _KEEP = int(os.environ["PAR_KEEP"])
+    FusedTopKRouter._compute_routing = ParFusedTopKRouter._compute_routing
+    BaseRouter._select_experts = _masked_select_experts(BaseRouter._select_experts)
+    BaseRouter._par_patched = True
+    # Only that the patch is in. Whether it *applies* is decided per router in the first
+    # forward, and the expert-parallel group does not exist yet at plugin load time.
+    _logger().info("par: router patched, keep=%d", _KEEP)
+
+
+def _masked_select_experts(inner):
+    """Gemma's path: rewrite the ids, let its own routing function weight them.
+
+    Only for a listed `CustomRoutingRouter` - `FusedTopKRouter` is already handled inside the
+    vendored routing unit, and anything else passes through. Kept exact rather than fast
+    because the gate weights here are not a plain renormalized softmax.
+    """
+    from vllm.model_executor.layers.fused_moe.router.custom_routing_router import (
+        CustomRoutingRouter)
 
     def _select_experts(self, hidden_states, router_logits, topk_indices_dtype=None, *,
                         input_ids=None):
         topk_weights, topk_ids = inner(self, hidden_states, router_logits,
                                        topk_indices_dtype=topk_indices_dtype,
                                        input_ids=input_ids)
-        why = _unsupported(self, router_logits, keep)
-        if why is not None:
-            _warn(logger, why)
+        if not isinstance(self, CustomRoutingRouter):
             return topk_weights, topk_ids
-        g = _ep_size()
-        # At warning level on purpose: this is the one line that says the kernel is actually
-        # running, and `logger.info` is below the root logger's level in a stock vLLM image,
-        # so an info-level version of it is invisible exactly where it matters.
-        _once(logger, "active", "par: placement-aware routing active, keep=%d of top_k=%d, "
-                                "ep_size=%d" % (keep, self.top_k, g), logger.warning)
-        ids = rewrite(router_logits, topk_ids, keep, g).long()
-        # The gate weights have to be the router's own rather than a reimplementation of them:
-        # Gemma-4 folds a learned per-expert output scale into them, and routers scope their
-        # softmax differently. So the rewritten selection goes back through the router's own
-        # `_compute_routing` as logits with every other expert at the dtype floor, which its
-        # top-k can only resolve to `ids`. Renormalization over the selection (guarded above)
-        # is what makes that exact: it divides out the softmax denominator the mask changed.
+        keep = par_keep(self, router_logits)
+        if keep is None:
+            return topk_weights, topk_ids
+        # The kernel's own weights are discarded here: a masked re-run through the router's
+        # routing function is the only way to keep Gemma's per-expert output scale. Its top-k
+        # can only resolve the mask to `ids`, and renormalization over the selection (guarded
+        # in `_unsupported`) divides out the softmax denominator the mask changed.
+        ids = rewrite(router_logits, topk_ids, keep, ep_size())[0].long()
         masked = torch.full_like(router_logits, torch.finfo(router_logits.dtype).min)
         masked.scatter_(1, ids, router_logits.gather(1, ids))
         w, out = self._compute_routing(hidden_states, masked, topk_indices_dtype,
                                        input_ids=input_ids)
         return w, self._convert_indices_dtype(out, topk_indices_dtype)
 
-    BaseRouter._select_experts = _select_experts
-    BaseRouter._par_patched = True
-    # Only that the patch is in. Whether it *applies* is decided per router in the first
-    # forward, and the expert-parallel group does not exist yet at plugin load time.
-    logger.info("par: router patched, keep=%d", keep)
-    # Touched so an import error surfaces at load time rather than in the first forward.
-    assert issubclass(FusedTopKRouter, BaseRouter)
-
-
-def _ep_size() -> int:
-    from vllm.distributed.parallel_state import get_ep_group
-
-    return get_ep_group().world_size
+    return _select_experts
 
 
 # Custom routing functions whose *selection* is a plain top-k over the gate logits, which is
@@ -146,17 +194,20 @@ def _unsupported(router, router_logits, keep: int) -> str | None:
     elif router.scoring_func != "softmax":
         return f"scoring_func={router.scoring_func!r}"
     if not router.renormalize:
-        # Without it the weights are the full softmax read at the selection, and the mask the
-        # weights are recomputed under would change their denominator.
+        # Without it the weights are the full softmax read at the selection, and the kernel's
+        # softmax is scoped to the selection alone.
         return "routing without renormalization"
     if router.eplb_state is not None:
         return "EPLB replication breaks the expert-to-rank map"
     k, e = router.top_k, router.global_num_experts
-    if keep >= k:
-        return f"keep={keep} >= top_k={k}, nothing to re-place"
+    # `keep == k` is allowed through on purpose. The rule then asks for no substitution and
+    # the selection is provably unchanged, so that arm measures what this plugin costs to run
+    # and nothing else - which is the only way to separate the plumbing from the rule.
+    if keep > k:
+        return f"keep={keep} > top_k={k}"
     if router_logits.shape[-1] != e:
         return f"router_logits width {router_logits.shape[-1]} != {e} experts"
-    g = _ep_size()
+    g = ep_size()
     if g < 2:
         return f"ep_size={g}, no all-to-all to shrink"
     if e % g or e // g < k:
