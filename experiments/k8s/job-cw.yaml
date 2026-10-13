@@ -96,13 +96,11 @@ spec:
         # rank. Dropping `tcp` and pinning the IB device instead was tried and reproduced the
         # same -3, which also rules device mismatch out as its cause.
         - {name: UCX_TLS, value: "rc_mlx5,cuda_copy,tcp,self"}
-        # One IB device, named, plus an ethernet one so `tcp` still has a netdev - pinning to
-        # `ibp0:1` alone starved it and brought -3 straight back. Every pod sees all 17 of its
-        # host's IB devices ACTIVE (`ibp0..ibp7`, `mlx5_0..mlx5_8`) while the RDMA resource
-        # grants one, and GPU-initiated RDMA wants the NIC on the granted GPU's PCIe switch,
-        # which is what `par-topo` resolves. Still open past this point: `prepMemView` on the
-        # *remote* descriptors, nixl_ep.cpp:1350, two lines after the local one passes.
-        - {name: UCX_NET_DEVICES, value: "${IBDEV}:1,eth0"}
+        # `UCX_NET_DEVICES` is deliberately absent: every pod sees all 17 of its host's IB
+        # devices ACTIVE while the RDMA resource grants one, and the device to pin depends on
+        # which of the eight GPUs this rank was handed, so run.sh resolves it per pod. Still
+        # open past this point: `prepMemView` on the *remote* descriptors, nixl_ep.cpp:1350,
+        # two lines after the local one passes.
         resources:
           limits: {cpu: "16", memory: ${MEM}, nvidia.com/gpu: "${GPUS}", rdma/ib: "1"}
           # A 2-core request, not 4. These hosts are shared and one of the five has 97% of its

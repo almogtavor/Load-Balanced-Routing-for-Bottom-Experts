@@ -10,6 +10,25 @@ PY="${PY:-python3}"
 # the script's own directory and the `import placement` siblings keep resolving.
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# One IB device, named - and which one it is depends on the pod, so it is resolved here rather
+# than passed in. `nvidia.com/gpu: 1` out of eight hands each rank an arbitrary GPU, and
+# GPU-initiated RDMA wants the NIC under the same PCIe root: on the host we probed the granted
+# GPU sat at 3b:00.0, which `nvidia-smi topo -m` puts PIX to `ibp1` and NODE to the other
+# seven - so the `ibp0` we had been pinning every rank to was the wrong device on that rank.
+# `eth0` is beside it because UCX needs `tcp` for the NIXL agent metadata exchange, and `tcp`
+# with no netdev of its own is what brought `loadRemoteMD` -3 back.
+if [ -z "${UCX_NET_DEVICES:-}" ] && [ -n "$(ls -d /sys/class/infiniband/ibp* 2>/dev/null)" ]; then
+  gpu="$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader | head -1 | cut -d: -f2- \
+         | tr 'A-Z' 'a-z')"
+  root="$(readlink -f "/sys/bus/pci/devices/0000:${gpu}" | cut -d/ -f4)"
+  for d in /sys/class/infiniband/ibp*; do
+    [ "$(readlink -f "${d}/device" | cut -d/ -f4)" = "${root}" ] || continue
+    export UCX_NET_DEVICES="$(basename "${d}"):1,eth0"
+    break
+  done
+  echo "gpu ${gpu} under ${root} -> UCX_NET_DEVICES=${UCX_NET_DEVICES:-<none local>}"
+fi
+
 if [ -n "${ARMS:-}" ]; then
   # Installed from a copy, not from /results: the entry point has to be importable in every
   # worker process, and four jobs share that PVC path.
