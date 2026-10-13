@@ -22,8 +22,17 @@ if [ -n "${ARMS:-}" ]; then
   # only way to reach the DeepEP dispatch - see the header of serve_run.py.
   if [ "${SERVE:-0}" = "1" ]; then script=experiments/serve_run.py
   else script=experiments/vllm_run.py; fi
-  for arm in ${ARMS//,/ }; do
-    ARM="${arm}" "${PY}" "${script}"
+  # `base` and `base2` are the same configuration launched twice, and on the first clean
+  # sweep they disagreed by 5.3% while the warm repeats inside each launch spread 0.8%. So a
+  # launch is the unit of analysis, not a repeat: repeats measure one engine's steady state,
+  # and the arms differ by which engine was started. REPS sweeps every arm once per pass, so
+  # whatever drifts between launches lands on all arms rather than on whichever ran first.
+  # REP0 offsets the index so a second job can add sweeps to a tag already measured
+  # instead of overwriting its files.
+  for rep in $(seq "${REP0:-0}" $(( ${REP0:-0} + ${REPS:-1} - 1 ))); do
+    for arm in ${ARMS//,/ }; do
+      REP="${rep}" ARM="${arm}" "${PY}" "${script}"
+    done
   done
   exit 0
 fi

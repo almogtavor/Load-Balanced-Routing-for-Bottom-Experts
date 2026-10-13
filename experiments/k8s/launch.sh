@@ -26,7 +26,7 @@ set -euo pipefail
 : "${GPUS:=4}" ; : "${MEM:=700Gi}" ; : "${TF4:=0}" ; : "${TFVER:=4.57.1}"
 : "${BATCH:=4}" ; : "${NWIN:=32}" ; : "${KEEPS:=6,4,2}"
 : "${STREAM:=multilingual}" ; : "${TOKREF:=/models/qwen_tok}" ; : "${NODE:=}"
-: "${ARMS:=}" ; : "${IMG:=v0.31.0}" ; : "${A2A:=}" ; : "${SERVE:=0}" ; : "${DP:=2}"
+: "${ARMS:=}" ; : "${IMG:=v0.31.0}" ; : "${A2A:=}" ; : "${SERVE:=0}" ; : "${DP:=2}" ; : "${REPS:=1}" ; : "${REP0:=0}"
 
 for kv in "$@"; do export "${kv?}"; done
 [ -n "${NAME}" ] && [ -n "${TAG}" ] && [ -n "${MODEL}" ] || {
@@ -34,9 +34,9 @@ for kv in "$@"; do export "${kv?}"; done
 
 # `nodeSelector: {${NODE}}`, so the pin is a whole `key: value` pair, not just a hostname.
 NODE="${NODE:+kubernetes.io/hostname: ${NODE}}"
-export NAME TAG MODEL GPUS MEM TF4 TFVER BATCH NWIN KEEPS STREAM TOKREF NODE ARMS IMG A2A SERVE DP
+export NAME TAG MODEL GPUS MEM TF4 TFVER BATCH NWIN KEEPS STREAM TOKREF NODE ARMS IMG A2A SERVE DP REPS REP0
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 oc delete job "par-${NAME}" --ignore-not-found >/dev/null
-envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $ARMS $IMG $A2A $SERVE $DP' \
+envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $ARMS $IMG $A2A $SERVE $DP $REPS $REP0' \
   < "${here}/job.yaml" | oc apply -f -
-echo "launched par-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} tf4=${TF4} arms=${ARMS:-offline} a2a=${A2A:-default} serve=${SERVE} dp=${DP}"
+echo "launched par-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} tf4=${TF4} arms=${ARMS:-offline} a2a=${A2A:-default} serve=${SERVE} dp=${DP} reps=${REPS} rep0=${REP0}"

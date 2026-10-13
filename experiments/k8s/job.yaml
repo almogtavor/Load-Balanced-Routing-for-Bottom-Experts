@@ -70,6 +70,8 @@ spec:
         - {name: TF4, value: "${TF4}"}
         # Non-empty switches run.sh to the vLLM path: one engine per listed arm, in order.
         - {name: ARMS, value: "${ARMS}"}
+        - {name: REPS, value: "${REPS}"}
+        - {name: REP0, value: "${REP0}"}
         # The all-to-all backend. Empty leaves vLLM's default (`allgather_reducescatter`),
         # whose dispatch volume is independent of per-token rank fan-out and therefore has
         # nothing for this kernel to save.

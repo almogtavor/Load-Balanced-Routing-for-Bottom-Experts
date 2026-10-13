@@ -7,9 +7,16 @@ unmodified engine; x is the paired accuracy delta on the same 198 GPQA items, te
 same exact McNemar test `bench.py` uses, so the offline figure and this one can be read side by
 side. Every number is a wall-clock measurement on a shared cluster, so the grey band is the
 `base2` arm - the stock engine loaded and measured a second time - and a point inside that band
-is one the instrument cannot call a speedup. The y error bar is the spread over warm repeats of
-one engine, which is the smaller of the two uncertainties; the band is the honest one. A black
-ring means McNemar resolves the accuracy difference at p < 0.05.
+is one the instrument cannot call a speedup.
+
+A launch is the unit of analysis, not a repeat. The repeats inside one launch sample one
+engine's steady state and spread under 1%, while `base` and `base2` - the same configuration
+launched twice - disagreed by 5.3%, so what separates two arms is mostly which engine got
+started. `REPS` sweeps every arm once per pass and writes `_r<n>`; the y error bar is the
+spread of the per-sweep paired ratio across those passes, and the p is an exact sign-flip test
+on it. An arm with one launch has no such spread: it is printed with `1 launch` and its bar
+falls back to the within-launch repeats, which is a floor on the error and not the error.
+A black ring means McNemar resolves the accuracy difference at p < 0.05.
 
 Unlike the offline sweep this leaves nothing to account for: the all-to-all, the expert GEMMs,
 the scheduler and the KV cache are all vLLM's, and the only thing replaced is which experts the
@@ -22,6 +29,7 @@ import itertools
 import json
 import os
 import pathlib
+import re
 import sys
 
 import matplotlib
@@ -60,26 +68,35 @@ def warm(r: dict) -> np.ndarray:
     return np.array(r.get("warm_tok_per_s") or [r["out_tok_per_s"]], float)
 
 
-def perm_p(a: np.ndarray, b: np.ndarray) -> float:
-    """Exact two-sided permutation p for `mean(a) != mean(b)`.
+def sign_p(d: np.ndarray) -> float:
+    """Exact two-sided sign-flip p for `mean(d) != 0` on a paired per-launch quantity.
 
-    With five repeats an arm there are only 252 ways to split the ten numbers, so the exact
-    test is cheaper than any approximation of it - and it needs no distributional assumption
-    about wall-clock times on a shared cluster, which is exactly the assumption one should
-    not want to make here.
+    The arm and its base are measured in the same sweep, so the pairing absorbs whatever the
+    cluster was doing that pass and only the sign of each difference is exchangeable. With a
+    handful of sweeps all 2^n flips are cheaper than any approximation of them, and the test
+    assumes nothing about the distribution of wall-clock times on a shared cluster - which is
+    exactly the assumption one should not want to make here.
     """
-    pool, n = np.concatenate([a, b]), len(a)
-    obs = abs(a.mean() - b.mean())
-    splits = list(itertools.combinations(range(len(pool)), n))
-    hits = sum(abs(pool[list(i)].mean() - pool[list(set(range(len(pool))) - set(i))].mean())
-               >= obs - 1e-12 for i in splits)
-    return hits / len(splits)
+    assert len(d) <= 16, f"{2 ** len(d)} sign flips is no longer the cheap way"
+    obs = abs(d.mean())
+    flips = np.array(list(itertools.product((1, -1), repeat=len(d))))
+    return float((np.abs((flips * d).mean(1)) >= obs - 1e-12).mean())
 
 
-def arms(tag: str) -> dict[str, dict]:
+def arms(tag: str) -> dict[str, dict[int, dict]]:
+    """`arm -> {sweep index: that launch's record}`, from the `_r<n>` suffix in the filename."""
     pre = "serve" if tag in ACC_FROM else "vllm"
-    return {p.stem.split("_", 2)[2]: json.loads(p.read_text())
-            for p in sorted(RUNS.glob(f"{pre}_{tag}_*.json"))}
+    out: dict[str, dict[int, dict]] = {}
+    for p in sorted(RUNS.glob(f"{pre}_{tag}_*.json")):
+        m = re.fullmatch(r"(.+)_r(\d+)", p.stem.split("_", 2)[2])
+        assert m, f"{p.name}: no sweep index, so a launch cannot be identified"
+        out.setdefault(m[1], {})[int(m[2])] = json.loads(p.read_text())
+    return out
+
+
+def first(launches: dict[int, dict]) -> dict:
+    """The earliest sweep's record. For quality, where a launch is not a source of variance."""
+    return launches[min(launches)]
 
 
 def rows(tag: str) -> list[dict]:
@@ -92,13 +109,14 @@ def rows(tag: str) -> list[dict]:
     # run for a throughput-only `dp` tag.
     acc = arms(ACC_FROM[tag]) if tag in ACC_FROM else a
     out = []
-    for name, r in a.items():
+    for name, launches in a.items():
         if name == "base":
             continue
         if name not in acc or "base" not in acc:
             print(f"[skip arm] {tag}/{name}: no accuracy run to pair it with")
             continue
-        ab, ar = acc["base"], acc[name]
+        r = first(launches)
+        ab, ar = first(acc["base"]), first(acc[name])
         assert len(ar["gpqa_hit"]) == len(ab["gpqa_hit"]), f"{tag}/{name}: item count moved"
         m = bench.mcnemar(np.array(ab["gpqa_hit"], bool), np.array(ar["gpqa_hit"], bool))
         # Language modelling, paired by window index. Same source as the accuracy: what the
@@ -109,17 +127,29 @@ def rows(tag: str) -> list[dict]:
             dnll, dnll_se = float(d.mean()), float(d.std(ddof=1) / np.sqrt(len(d)))
         else:
             dnll = dnll_se = float("nan")
-        wa, wb = warm(r), warm(base)
-        # Ratio of means with the delta method, so the error bar on the figure is the error on
-        # the quantity actually plotted rather than on either arm alone.
-        ra = wa.mean() / wb.mean()
-        rse = ra * np.hypot(wa.std(ddof=1) / np.sqrt(len(wa)) / wa.mean(),
-                            wb.std(ddof=1) / np.sqrt(len(wb)) / wb.mean()) if len(wa) > 1 else 0.0
+        # One ratio per sweep, arm over base from that same sweep, and the spread of those
+        # ratios is the error bar. Sweeps the base did not run are dropped rather than
+        # compared against a different pass's engine.
+        reps = sorted(set(launches) & set(base))
+        assert reps, f"{tag}/{name}: no sweep where both this arm and base ran"
+        pair = np.array([warm(launches[i]).mean() / warm(base[i]).mean() for i in reps])
+        ra = float(pair.mean())
+        if len(pair) > 1:
+            rse = float(pair.std(ddof=1) / np.sqrt(len(pair)))
+            p_tp = sign_p(np.log(pair))
+        else:
+            # A floor, not an error: it is the spread of one engine's repeats, and the thing
+            # that actually varies between arms is which engine was started.
+            wa, wb = warm(launches[reps[0]]), warm(base[reps[0]])
+            rse = ra * np.hypot(wa.std(ddof=1) / np.sqrt(len(wa)) / wa.mean(),
+                                wb.std(ddof=1) / np.sqrt(len(wb)) / wb.mean()
+                                ) if len(wa) > 1 else 0.0
+            p_tp = float("nan")
         out.append({"arm": name, "keep": r["keep"],
-                    "up": (ra - 1) * 100, "up_se": 100 * float(rse),
-                    "p_tp": perm_p(wa, wb) if len(wa) > 1 and len(wb) > 1 else float("nan"),
-                    "n_rep": len(wa),
-                    "tok_s": wa.mean(), "base_tok_s": wb.mean(),
+                    "up": (ra - 1) * 100, "up_se": 100 * float(rse), "p_tp": p_tp,
+                    "n_launch": len(pair),
+                    "tok_s": float(np.mean([warm(launches[i]).mean() for i in reps])),
+                    "base_tok_s": float(np.mean([warm(base[i]).mean() for i in reps])),
                     "dacc": 100 * m["dacc"], "p": m["p_mcnemar"], "sig": m["resolved"],
                     "dnll": dnll, "dnll_se": dnll_se,
                     "n_disc": m["n_discordant"]})
@@ -139,21 +169,22 @@ def main() -> None:
         rs = rows(tag)
         if not rs:
             pre = "serve" if tag in ACC_FROM else "vllm"
-            print(f"[skip] {tag}: no {pre}_{tag}_base.json")
+            print(f"[skip] {tag}: no {pre}_{tag}_base_r*.json")
             continue
         drawn.append(tag)
         c = COLOR.get(tag, "#777777")
         print(f"\n{LABEL.get(tag, tag)}  base {rs[0]['base_tok_s']:.1f} out-tok/s "
-              f"(mean of {rs[0]['n_rep']} warm repeats)")
+              f"(mean over {rs[0]['n_launch']} launch(es))")
         for r in rs:
             print(f"  {r['arm']:>5}  {r['tok_s']:8.1f} tok/s  "
-                  f"{r['up']:+6.2f}%+-{r['up_se']:.2f}  p_tput={r['p_tp']:.3f}   "
+                  f"{r['up']:+6.2f}%+-{r['up_se']:.2f}  p_tput={r['p_tp']:.3f}  "
+                  f"{r['n_launch']} launch{'es' if r['n_launch'] > 1 else ' (bar is a floor)'}   "
                   f"dacc {r['dacc']:+6.2f}  p_acc={r['p']:.3f}  discordant={r['n_disc']}"
                   f"   dnll {r['dnll']:+.5f}+-{r['dnll_se']:.5f}"
                   f"{'  ACC-RESOLVED' if r['sig'] else ''}")
         for r in rs:
             if r["keep"] is None:
-                floor.append(abs(r["up"]))
+                floor.append(abs(r["up"]) + r["up_se"])
                 continue
             ax.errorbar(r["dacc"], r["up"], yerr=r["up_se"], marker="o", ms=7, color=c,
                         mec=c, mfc=c, ecolor=c, elinewidth=0.9, capsize=2)
@@ -180,11 +211,12 @@ def main() -> None:
     if not drawn:
         raise SystemExit("no vllm_*_base.json in runs/")
     if floor:
-        # The repeat baseline is the resolution of the y axis. Drawing it is the difference
-        # between a measurement and a number.
+        # `base2` against `base` is the stock engine against itself, so this band is the
+        # resolution of the y axis: an arm inside it is not distinguishable from relaunching
+        # the baseline. Drawing it is the difference between a measurement and a number.
         f = max(floor)
         ax.axhspan(-f, f, color="black", alpha=0.08, zorder=0)
-        ax.annotate(f"repeat-baseline spread ($\\pm${f:.2f}%)", (0.02, 0.5 + f), xycoords=
+        ax.annotate(f"baseline relaunched ($\\pm${f:.2f}%)", (0.02, 0.5 + f), xycoords=
                     ("axes fraction", "data"), fontsize=7, color="#444444", va="bottom")
         axn.axhspan(-f, f, color="black", alpha=0.08, zorder=0)
     for a in (ax, axn):
