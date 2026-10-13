@@ -6,7 +6,7 @@
 #   ./launch.sh NAME=hy  TAG=hy13b MODEL=/models/hy_bf16 TF4=1 BATCH=1
 #   ./launch.sh NAME=gm  TAG=gm26b MODEL=/models/gm_bf16
 #
-# `ARMS=base,base2,6,4,2` switches the job to the real vLLM measurement, one engine load per
+# `ARMS=base,base2,6,4,2,base3` switches the job to the real vLLM measurement, one engine load per
 # arm; the offline three-phase run is what you get without it. Adding `SERVE=1 DP=2` runs those
 # arms against a real `vllm serve` on the DeepEP dispatch instead of the offline API, which is
 # the only shape where the volume this kernel shrinks is the volume the engine moves - vLLM's

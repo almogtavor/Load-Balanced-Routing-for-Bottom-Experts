@@ -241,7 +241,7 @@ the pair is the point.
 
 ```bash
 # the real measurement: one vLLM engine per arm
-MODEL=/models/qwen3-30b-a3b TAG=q30rh ARMS=base,base2,6,4,2 experiments/run.sh
+MODEL=/models/qwen3-30b-a3b TAG=q30rh ARMS=base,base2,6,4,2,base3 experiments/run.sh
 python experiments/compare.py
 
 # the offline sweep: needs a cached token stream at $STREAMS/$STREAM.npy
@@ -252,9 +252,9 @@ python experiments/plot.py
 On OpenShift, one Job per model (`ARMS` switches a job to the vLLM path):
 
 ```bash
-experiments/k8s/launch.sh NAME=q30 TAG=q30rh MODEL=/models/bf16      ARMS=base,base2,6,4,2
-experiments/k8s/launch.sh NAME=q35 TAG=q35   MODEL=/models/q35_bf16  ARMS=base,base2,6,4,2
-experiments/k8s/launch.sh NAME=gm  TAG=gm26b MODEL=/models/gm_bf16   ARMS=base,base2,6,4,2
+experiments/k8s/launch.sh NAME=q30 TAG=q30rh MODEL=/models/bf16      ARMS=base,base2,6,4,2,base3
+experiments/k8s/launch.sh NAME=q35 TAG=q35   MODEL=/models/q35_bf16  ARMS=base,base2,6,4,2,base3
+experiments/k8s/launch.sh NAME=gm  TAG=gm26b MODEL=/models/gm_bf16   ARMS=base,base2,6,4,2,base3
 # Hunyuan has no vLLM arm - see "The measurements" - so it runs the offline sweep only:
 experiments/k8s/launch.sh NAME=hy  TAG=hy13b MODEL=/models/hy_bf16   TF4=1 BATCH=1
 ```
