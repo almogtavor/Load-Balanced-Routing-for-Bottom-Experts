@@ -73,4 +73,4 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ${KCTL} delete job "par-${NAME}" --ignore-not-found >/dev/null
 envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $ARMS $IMG $A2A $SERVE $DP $REPS $REP0 $N_REQ $PROMPT_LEN $GEN_LEN $REPEATS $BATCH_TOK $NODES $BAD $NS $CLAIM' \
   < "${here}/${TPL}" | ${KCTL} apply -f -
-echo "launched par-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} tf4=${TF4} arms=${ARMS:-offline} a2a=${A2A:-default} serve=${SERVE} dp=${DP} reps=${REPS} rep0=${REP0} shape=${N_REQ}x${PROMPT_LEN}/${GEN_LEN} btok=${BATCH_TOK} nodes=${NODES} ep=$(( DP * NODES ))"
+echo "launched par-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} tf4=${TF4} arms=${ARMS:-offline} a2a=${A2A:-default} serve=${SERVE} dp=${DP} reps=${REPS} rep0=${REP0} shape=${N_REQ}x${PROMPT_LEN}/${GEN_LEN} btok=${BATCH_TOK} nodes=${NODES} ep=$(( GPUS * NODES ))"

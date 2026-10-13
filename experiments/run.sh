@@ -17,8 +17,12 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # seven - so the `ibp0` we had been pinning every rank to was the wrong device on that rank.
 # `eth0` is beside it because UCX needs `tcp` for the NIXL agent metadata exchange, and `tcp`
 # with no netdev of its own is what brought `loadRemoteMD` -3 back.
-if [ -z "${UCX_NET_DEVICES:-}" ] && [ -n "$(ls -d /sys/class/infiniband/ibp* 2>/dev/null)" ]; then
-  gpu="$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader | head -1 | cut -d: -f2- \
+# Only when this pod was granted exactly one GPU: with several there is no single right NIC,
+# and `head -1` would close the pipe while `nvidia-smi` was still writing - SIGPIPE under
+# `pipefail` killed the first multi-GPU run here at exit 141. `sed -n 1p` reads to EOF.
+if [ -z "${UCX_NET_DEVICES:-}" ] && [ "$(nvidia-smi -L | wc -l)" = "1" ] \
+   && [ -n "$(ls -d /sys/class/infiniband/ibp* 2>/dev/null)" ]; then
+  gpu="$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader | sed -n 1p | cut -d: -f2- \
          | tr 'A-Z' 'a-z')"
   root="$(readlink -f "/sys/bus/pci/devices/0000:${gpu}" | cut -d/ -f4)"
   for d in /sys/class/infiniband/ibp*; do
