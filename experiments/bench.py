@@ -47,6 +47,8 @@ import json
 import math
 import os
 import pathlib
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -75,6 +77,13 @@ def fetch_rows(source: str = SOURCE, config: str = "default", split: str = SPLIT
     `cap` stops early, which is what a caller that only needs a few hundred thousand
     characters of text wants; 0 means every row.
     """
+    # Cached beside the results, because this is the one step of a sweep that depends on a
+    # service nobody here controls: an arm sweep calls this once per arm, and a 502 from the
+    # dataset server on arm 3 killed a whole q35 job and burned a Job retry. One fetch per
+    # dataset per PVC, shared by every arm of every job, and retried while it is being made.
+    cache = OUT / f"rows.{source.replace('/', '_')}.{config}.{split}.{cap}.json"
+    if cache.exists():
+        return json.loads(cache.read_text())
     tok = os.environ.get("HF_TOKEN")
     head = {"Authorization": f"Bearer {tok}"} if tok else {}
     rows: list[dict] = []
@@ -82,9 +91,24 @@ def fetch_rows(source: str = SOURCE, config: str = "default", split: str = SPLIT
         u = (f"https://datasets-server.huggingface.co/rows"
              f"?dataset={urllib.parse.quote(source, safe='')}&config={config}"
              f"&split={split}&offset={len(rows)}&length=100")
-        d = json.load(urllib.request.urlopen(urllib.request.Request(u, headers=head), timeout=120))
+        req = urllib.request.Request(u, headers=head)
+        for attempt in range(6):
+            try:
+                d = json.load(urllib.request.urlopen(req, timeout=120))
+                break
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+                # 5xx and a dropped connection are the server having a moment; a 4xx is the
+                # request being wrong and will not get better by being sent again.
+                if isinstance(e, urllib.error.HTTPError) and e.code < 500:
+                    raise
+                if attempt == 5:
+                    raise
+                print(f"[data] {type(e).__name__} {e}, retry {attempt + 1}/5", flush=True)
+                time.sleep(2 ** attempt)
         rows += [r["row"] for r in d["rows"]]
         if len(rows) >= d["num_rows_total"] or (cap and len(rows) >= cap):
+            OUT.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(rows))
             return rows
 
 
