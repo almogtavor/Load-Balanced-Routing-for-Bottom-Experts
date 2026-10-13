@@ -128,7 +128,12 @@ def rows(tag: str) -> list[dict]:
 
 
 def main() -> None:
-    fig, ax = plt.subplots(figsize=(7.4, 5.2))
+    # Two x axes against the same y: GPQA on the left, language modelling on the right.
+    # They are the two halves of "did this cost anything", and they have very different
+    # power - 198 items resolve a few points at best, 32 paired windows resolve a
+    # thousandth of a nat - so showing one without the other would read as a stronger or
+    # weaker result than the data supports.
+    fig, (ax, axn) = plt.subplots(1, 2, figsize=(11.6, 5.2), sharey=True)
     drawn, floor = [], []
     for tag in TAGS:
         rs = rows(tag)
@@ -157,8 +162,20 @@ def main() -> None:
             if r["sig"]:
                 ax.plot(r["dacc"], r["up"], ls="none", marker="o", ms=13, mfc="none",
                         mec="black", mew=1.2)
+            if not np.isnan(r["dnll"]):
+                axn.errorbar(r["dnll"], r["up"], yerr=r["up_se"], xerr=r["dnll_se"], marker="o",
+                             ms=7, color=c, mec=c, mfc=c, ecolor=c, elinewidth=0.9, capsize=2)
+                axn.annotate(f" keep={r['keep']}", (r["dnll"], r["up"]), fontsize=7, color=c,
+                             va="center", ha="left")
+                # Resolved at 3 sigma on a paired difference over 32 windows, which is the
+                # threshold at which this axis says more than the GPQA one does.
+                if abs(r["dnll"]) > 3 * r["dnll_se"]:
+                    axn.plot(r["dnll"], r["up"], ls="none", marker="o", ms=13, mfc="none",
+                             mec="black", mew=1.2)
         keeps = [r for r in rs if r["keep"] is not None]
         ax.plot([r["dacc"] for r in keeps], [r["up"] for r in keeps], color=c, lw=1.4)
+        kn = [r for r in keeps if not np.isnan(r["dnll"])]
+        axn.plot([r["dnll"] for r in kn], [r["up"] for r in kn], color=c, lw=1.4)
 
     if not drawn:
         raise SystemExit("no vllm_*_base.json in runs/")
@@ -169,13 +186,17 @@ def main() -> None:
         ax.axhspan(-f, f, color="black", alpha=0.08, zorder=0)
         ax.annotate(f"repeat-baseline spread ($\\pm${f:.2f}%)", (0.02, 0.5 + f), xycoords=
                     ("axes fraction", "data"), fontsize=7, color="#444444", va="bottom")
-    ax.axhline(0, color="black", lw=0.6)
-    ax.axvline(0, color="black", lw=0.6)
-    ax.grid(alpha=0.25)
+        axn.axhspan(-f, f, color="black", alpha=0.08, zorder=0)
+    for a in (ax, axn):
+        a.axhline(0, color="black", lw=0.6)
+        a.axvline(0, color="black", lw=0.6)
+        a.grid(alpha=0.25)
     ax.set_xlabel(r"paired $\Delta$accuracy on GPQA, 198 items"
                   "\n(left is worse, black ring = McNemar $p<0.05$)")
+    axn.set_xlabel(r"paired $\Delta$NLL on held-out text, 32 windows"
+                   "\n(right is worse, black ring = $|\\Delta| > 3\\sigma$)")
     ax.set_ylabel("end-to-end decode throughput vs. unmodified vLLM (%)")
-    ax.set_title("Placement-aware routing in vLLM, expert-parallel over 4 GPUs")
+    fig.suptitle("Placement-aware routing in vLLM, expert-parallel over 4 GPUs")
     ax.legend(handles=[plt.Line2D([], [], color=COLOR[t], marker="o", label=LABEL.get(t, t))
                        for t in drawn], fontsize=8, loc="best", framealpha=0.9)
     fig.tight_layout()
