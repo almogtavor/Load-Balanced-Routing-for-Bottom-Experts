@@ -93,6 +93,33 @@ The reason there is nothing on the other side of it is the dispatch. vLLM 0.31 d
 not depend on per-token GPU fan-out, so this rule has nothing to shrink and its extra work is
 pure cost.
 
+### How much there is to shrink, before anything is measured
+
+Dispatch volume is per-token GPU fan-out, and for uniform logits that is analytic: a rank
+holds `E/G` of the `E` experts, so a top-k drawn without replacement misses it with
+probability `prod_i (E-E/G-i)/(E-i)`, and a token touches `G (1 - p(k))` ranks. The rewrite
+makes a token's rank set its top-`keep`'s rank set, so the same expression at `n = keep` is
+the fan-out afterwards. `expected_fanout` in `src/par/kernel.py` is that formula, asserted
+against the measured fan-out in the self-check and printed by it:
+
+| `ep_size` | top-8 touches | `keep=6` | `keep=4` | `keep=2` |
+| --- | --- | --- | --- | --- |
+| 2 | 1.99 / 2 | 1.1% | 5.7% | 24.6% |
+| 4 | 3.63 / 4 | 8.6% | 24.1% | 51.6% |
+| 8 | 5.34 / 8 | 16.3% | 37.4% | 64.8% |
+| 16 | 6.60 / 16 | 20.8% | 44.2% | 70.5% |
+| 32 | 7.36 / 32 | 23.2% | 47.6% | 73.1% |
+
+Two things follow, and both are about what these runs can and cannot show. The headroom is
+governed by the rank count: at `ep_size=4`, which is the width these experiments fit on,
+`keep=4` removes a quarter of the dispatch volume, and dispatch is a fraction of a decode
+step - so a few percent is the ceiling on the whole arm, and an arm that comes back flat here
+has not tested the rule, only this width. And the headroom does not grow with how many tokens
+are in flight: throughput is a rate, every decode step pays the same dispatch and the same
+per-layer cost, so the arm-over-base ratio is invariant in sequence length. A saving that
+looks small per step does not accumulate into a large one over a long generation. What makes
+it large is a wider deployment.
+
 ### What the rule costs in quality
 
 Paired `delta`NLL on 32 windows of held-out wikitext, same windows across arms, mean +- SE of

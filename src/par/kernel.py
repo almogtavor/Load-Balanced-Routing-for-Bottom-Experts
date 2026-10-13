@@ -34,6 +34,8 @@ so they are correct on any top-k implementation whose output is the global top-k
 
 from __future__ import annotations
 
+import sys
+
 import torch
 
 try:
@@ -42,7 +44,25 @@ try:
 except ImportError:                                                    # CPU-only dev boxes
     triton = None
 
-__all__ = ["rank_of", "rewrite", "rewrite_torch", "rewrite_triton", "fanout", "gate_weights"]
+__all__ = ["rank_of", "rewrite", "rewrite_torch", "rewrite_triton", "fanout", "gate_weights",
+           "expected_fanout"]
+
+
+def expected_fanout(n_picks: int, n_ranks: int, n_experts: int) -> float:
+    """Mean distinct ranks a top-`n_picks` selection touches, for uniform random logits.
+
+    A rank holds `E/G` of the `E` experts, so a top-k drawn without replacement misses it with
+    probability `prod_i (E - E/G - i)/(E - i)`. The rewrite leaves a token's rank set equal to
+    its top-`keep`'s rank set, so this is both the baseline fan-out at `n_picks = k` and the
+    rewritten fan-out at `n_picks = keep` - and the ratio between them is the ceiling on what
+    the rule can cut from dispatch volume, before any of it reaches a real routing
+    distribution. It is governed by `n_ranks`, not by how many tokens are in flight, which is
+    why the headroom grows with the width of the deployment and not with sequence length.
+    """
+    import math
+
+    return n_ranks * (1 - math.prod((n_experts - n_experts // n_ranks - i) / (n_experts - i)
+                                    for i in range(n_picks)))
 
 
 def rank_of(n_experts: int, n_ranks: int, device=None) -> torch.Tensor:
@@ -209,15 +229,13 @@ def _check() -> None:
     rewrite. An off-by-one in the rank map, a head that does not survive, or a substitute taken
     off a cold rank all move these away from the closed form.
     """
-    import math
-
     torch.manual_seed(0)
     E, G, K, T = 256, 4, 8, 20000
     z = torch.randn(T, E)
     base = z.topk(K, -1).indices
 
     def closed_form(n):
-        return G * (1 - math.prod((E - E // G - i) / (E - i) for i in range(n)))
+        return expected_fanout(n, G, E)
 
     assert abs(fanout(base, G, E).float().mean() - closed_form(K)) < 0.02
 
@@ -284,8 +302,25 @@ def _check() -> None:
         assert {int(e) // (E // G) for e in got[3]} == head, "row collapsed onto its head"
         print("  padded/garbage rows pass through, sound rows in the same batch do not")
 
+    # The headroom, for the deployment widths the rule is aimed at. Printed because the number
+    # that matters for throughput is not measured on this box: a rank count of 4 leaves almost
+    # nothing to cut, so an arm that comes back flat there has not tested the rule.
+    print(f"  headroom at E={128}, k={8} (dispatch volume cut, uniform logits):")
+    for g in (2, 4, 8, 16, 32):
+        base_f = expected_fanout(8, g, 128)
+        cut = "  ".join(f"keep={keep} {100 * (1 - expected_fanout(keep, g, 128) / base_f):5.1f}%"
+                        for keep in (6, 4, 2))
+        print(f"    ep_size={g:<3} fan-out {base_f:5.2f}/{g:<3} {cut}")
+
     print(f"par.kernel: ok (triton {'present' if triton else 'absent'})")
 
 
 if __name__ == "__main__":
+    # The Triton half of this check is skipped wherever CUDA is missing, which is right on a
+    # laptop and wrong on a GPU job: a node whose driver is sick reports no devices, and then
+    # the one gate that proves the kernel agrees with the reference *on this hardware* passes
+    # by testing nothing. `--cpu` is the laptop's way of asking for the reduced check, so a
+    # bare run on a broken node fails here instead of measuring an engine that fell back.
+    if "--cpu" not in sys.argv:
+        assert torch.cuda.is_available(), "no CUDA device: run with --cpu to check the reference"
     _check()

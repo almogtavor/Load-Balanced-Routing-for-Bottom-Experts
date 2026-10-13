@@ -40,6 +40,7 @@ import numpy as np
 MODEL = os.environ["MODEL"]
 TAG = os.environ["TAG"]
 ARM = os.environ.get("ARM", "base")                   # base | base2 | an integer `keep`
+REP = os.environ.get("REP", "0")                      # which sweep; a launch is the unit
 N_GPUS = int(os.environ.get("GPUS", 4))
 DP = int(os.environ.get("DP", 2))
 # `or`, not a `get` default: the job template exports every knob it knows about, so an
@@ -139,10 +140,11 @@ def main() -> None:
     warm = [r["out_tok_per_s"] for r in tp[1:]] or [tp[0]["out_tok_per_s"]]
 
     OUT.mkdir(exist_ok=True)
-    (OUT / f"serve_{TAG}_{ARM}.json").write_text(json.dumps({
+    (OUT / f"serve_{TAG}_{ARM}_r{REP}.json").write_text(json.dumps({
         # A result carries no clue which kernel wrote it, and `compare.py` globs arms by
         # tag - so without this a file left over from a superseded run aggregates
         # silently beside a fresh one. A missing field fails loudly; a stale number does not.
+        "rep": int(REP),
         "written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "tag": TAG, "model": MODEL, "arm": ARM, "keep": keep, "n_gpus": N_GPUS,
         "vllm": __import__("vllm").__version__, "a2a": A2A, "dp": DP, "tp": N_GPUS // DP,
@@ -150,7 +152,7 @@ def main() -> None:
         "throughput": tp, "warm_tok_per_s": warm,
         "out_tok_per_s": float(np.median(warm)),
     }, indent=1) + "\n")
-    print(f"WROTE {OUT}/serve_{TAG}_{ARM}.json", flush=True)
+    print(f"WROTE {OUT}/serve_{TAG}_{ARM}_r{REP}.json", flush=True)
 
 
 if __name__ == "__main__":
