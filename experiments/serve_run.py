@@ -42,7 +42,9 @@ TAG = os.environ["TAG"]
 ARM = os.environ.get("ARM", "base")                   # base | base2 | an integer `keep`
 N_GPUS = int(os.environ.get("GPUS", 4))
 DP = int(os.environ.get("DP", 2))
-A2A = os.environ.get("A2A", "deepep_high_throughput")
+# `or`, not a `get` default: the job template exports every knob it knows about, so an
+# unset `A2A` arrives as the empty string and would reach vLLM as an invalid choice.
+A2A = os.environ.get("A2A") or "deepep_high_throughput"
 MAX_LEN = int(os.environ.get("MAX_LEN", 2048))
 N_REQ = int(os.environ.get("N_REQ", 256))
 PROMPT_LEN = int(os.environ.get("PROMPT_LEN", 1024))
