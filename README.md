@@ -66,27 +66,63 @@ serve garbage.
 ## What it measures out at
 
 In a stock vLLM 0.31 engine, four GPUs, expert-parallel, the rule **costs throughput and does
-not pay for it**. Decode throughput vs. the unmodified engine, mean of five warm repeats, with
-the paired GPQA delta on the same 198 items:
+not pay for it**. Decode throughput vs. the unmodified engine, mean of five warm repeats:
 
 | | `base2` (repeat) | `keep=6` | `keep=4` | `keep=2` |
 | --- | --- | --- | --- | --- |
-| Qwen3-30B-A3B | +0.70% | -6.34% | -9.09% | -14.51% |
-| Qwen3.5-35B | +0.38% | -8.03% | -7.09% | -10.23% |
-| Gemma-4-26B-A4B | +0.24% | -42.80% | -45.58% | -43.20% |
-| paired dacc, worst arm | - | -4.04 (p=0.27) | -0.51 (p=1.00) | -7.58 (p=0.008) |
+| Qwen3-30B-A3B | -0.71% | -8.42% | -10.56% | -16.30% |
+| Qwen3.5-35B | +0.39% | -6.69% | -7.96% | -11.45% |
+| Gemma-4-26B-A4B | +0.21% | -4.06% | -5.77% | -10.66% |
 
-Every throughput delta clears the repeat baseline (`p=0.008`, the exact permutation floor at
-five repeats an arm); only one accuracy cell resolves at all, and it is `keep=2` on Qwen3.5.
+Every keep arm clears the repeat baseline at `p=0.008`, the exact permutation floor at five
+repeats an arm; no `base2` arm does. The loss grows monotonically as `keep` falls on all three
+families, which is the cost of rewriting more ids per layer.
 
-The reason is the dispatch. vLLM 0.31 defaults to `allgather_reducescatter`, which gathers
-every token onto every rank: the volume it moves does not depend on per-token GPU fan-out, so
-there is nothing here for this rule to shrink and its extra work is pure cost. The two cost
-shapes are visible in the table. On the Qwen models the loss grows monotonically as `keep`
-falls, which is the cost of rewriting more ids. On Gemma it is flat and five times larger,
-because Gemma-4 routes through a custom Python routing function rather than a fused top-k, and
-the exactness-preserving hook runs that function a second time per MoE layer - a cost paid per
-layer whatever `keep` is.
+The reason there is nothing on the other side of it is the dispatch. vLLM 0.31 defaults to
+`allgather_reducescatter`, which gathers every token onto every rank: the volume it moves does
+not depend on per-token GPU fan-out, so this rule has nothing to shrink and its extra work is
+pure cost.
+
+### What the rule costs in quality
+
+Paired `delta`NLL on 32 windows of held-out wikitext, same windows across arms, mean +- SE of
+the paired difference; **bold** is resolved at 3 sigma:
+
+| | `base2` (repeat) | `keep=6` | `keep=4` | `keep=2` |
+| --- | --- | --- | --- | --- |
+| Qwen3-30B-A3B | +0.0004 +-0.0003 | -0.0006 +-0.0008 | **+0.0100 +-0.0016** | **+0.1594 +-0.0047** |
+| Qwen3.5-35B | -0.0009 +-0.0007 | +0.0022 +-0.0013 | **+0.0180 +-0.0024** | **+0.1051 +-0.0058** |
+| Gemma-4-26B-A4B | -0.0000 +-0.0000 | +0.032 +-0.070 | +0.126 +-0.113 | +0.420 +-0.154 |
+
+This is the axis with the statistical power, and it says `keep=6` is free on both Qwen families
+and **`keep=4` is not**: +0.0100 nats at t=6.3 and +0.0180 at t=7.6, both replicated at the same
+size by a second independent pass of all five arms (+0.0096 +-0.0016, +0.0185 +-0.0023). The
+common claim that the bottom of a top-8 selection is substitutable holds here down to `keep=6`
+and starts to cost at `keep=4`, well before it becomes visible on a benchmark.
+
+Gemma is a weaker instrument on this axis, not a better result: its paired per-window spread is
+two orders of magnitude wider than the Qwens' (+-0.07 against +-0.0008), so nothing below
+`keep=2` resolves (t=2.7 there). Its `base2` arm reproduces `base` to five decimals, so the
+pairing is sound - the spread is real per-window variance under re-routing.
+
+Gemma's absolute NLL is high (5.66 nats) and that is the checkpoint, not the harness: the
+offline HF path gets 5.85 for it on a different corpus. Prepending a `<bos>` to these
+mid-corpus windows - the obvious suspect - was measured and makes it worse (9.73 nats, and
+`base` stops reproducing `base2`), so the windows are scored without one. See `nll()`.
+
+### What the benchmark can and cannot see
+
+Accuracy is GPQA, 198 items, scored by option likelihood and paired per item. It resolves one
+arm in the whole sweep - Qwen3.5 at `keep=2`, -5.05 points at `p=0.041` - and that is the axis'
+ceiling, not evidence the other arms are free:
+
+* All three baselines sit at or near chance (0.2727, 0.3283, 0.2222 against 0.25), so there is
+  almost no headroom for a degradation to show up in.
+* The stock engine, loaded twice, disagrees with itself on 0-12 of the 198 items, which is
+  +-2 accuracy points of instrument noise before any arm is applied.
+* Qwen3-30B at `keep=4` reads nominally **positive** (+4.04, `p=0.077`) on the same arm the NLL
+  axis resolves as a real loss. At near-chance accuracy that is noise with a sign, and reporting
+  it as a gain would be the easiest way to cheat here.
 
 ### The backend where the saving exists
 
