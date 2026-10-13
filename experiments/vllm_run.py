@@ -118,8 +118,8 @@ def gpqa(llm) -> np.ndarray:
     return s.argmax(1) == np.array([g for _, _, g in items])
 
 
-def nll(llm) -> list[float]:
-    """`[N_WIN]` mean NLL over positions `1..L-1` of each window of held-out text.
+def nll(llm) -> tuple[list[float], int | None]:
+    """Mean NLL per window of held-out text, over `N_WIN` windows, and the BOS id used.
 
     `prompt_logprobs=0` returns, for each prompt token, the log-prob the model gave it in
     context, which is exactly the negative of the cross-entropy `accuracy.py` computes through
@@ -136,19 +136,29 @@ def nll(llm) -> list[float]:
 
     import bench
 
-    seq = MAX_LEN - 1
+    tok = llm.get_tokenizer()
+    # A window is a slice out of the middle of a corpus, so it has no document start to give
+    # the model - and a model trained to always see a BOS reads the first slice token as if it
+    # followed one. Gemma is the case in point: without this its NLL here is 5.66 nats against
+    # 1.9 for the Qwens, and its per-window spread is twenty times theirs. Prepended rather
+    # than left out, and recorded in the output, because it changes the quantity measured.
+    bos = tok.bos_token_id
+    seq = MAX_LEN - 1 - (bos is not None)
     # A wikitext row is ~300 characters, so ~75 tokens; ask for twice the windows' worth and
     # stop there rather than pulling all 4358 rows in 44 requests an arm. The assert below is
     # what catches a corpus that turns out shorter than this arithmetic assumes.
     rows = bench.fetch_rows(LM_SOURCE, LM_CONFIG, LM_SPLIT, cap=N_WIN * seq // 50)
     text = "".join(r["text"] for r in rows)
-    ids = llm.get_tokenizer()(text, add_special_tokens=False).input_ids
+    ids = tok(text, add_special_tokens=False).input_ids
     assert len(ids) >= N_WIN * seq, f"{LM_SOURCE} gave {len(ids)} tokens, need {N_WIN * seq}"
     win = np.asarray(ids[: N_WIN * seq]).reshape(N_WIN, seq)
-    outs = llm.generate([TokensPrompt(prompt_token_ids=w.tolist()) for w in win],
+    pre = [] if bos is None else [bos]
+    outs = llm.generate([TokensPrompt(prompt_token_ids=pre + w.tolist()) for w in win],
                         SamplingParams(temperature=0, max_tokens=1, prompt_logprobs=0))
+    # From 1, because position 0 is predicted by nothing - with a BOS prepended that drops the
+    # BOS and scores every token of the window itself.
     return [-float(np.mean([next(iter(d.values())).logprob for d in o.prompt_logprobs[1:]]))
-            for o in outs]
+            for o in outs], bos
 
 
 def throughput(llm) -> list[dict]:
@@ -190,7 +200,7 @@ def main() -> None:
     llm = engine()
     hit = gpqa(llm)
     print(f"[{TAG}/{ARM}] gpqa acc={hit.mean():.4f} n={len(hit)}", flush=True)
-    pw = nll(llm)
+    pw, bos = nll(llm)
     print(f"[{TAG}/{ARM}] nll={np.mean(pw):.5f} over {len(pw)} windows", flush=True)
     tp = throughput(llm)
     warm = [r["out_tok_per_s"] for r in tp[1:]] or [tp[0]["out_tok_per_s"]]
@@ -204,7 +214,7 @@ def main() -> None:
         # Per window, not just the mean: the arm gap is a paired difference and needs the
         # pairing kept. `compare.py` reads this list.
         "nll": float(np.mean(pw)), "nll_per_window": pw, "n_win": len(pw),
-        "lm_source": f"{LM_SOURCE}/{LM_CONFIG}/{LM_SPLIT}",
+        "lm_source": f"{LM_SOURCE}/{LM_CONFIG}/{LM_SPLIT}", "lm_bos": bos,
         "throughput": tp,
         # Warm repeats only, median: the first pays for CUDA graph capture and the Triton
         # autotune, which is a real cost but not the one being compared. `compare.py` reads
