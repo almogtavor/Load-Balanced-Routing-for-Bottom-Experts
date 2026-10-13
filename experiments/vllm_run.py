@@ -208,8 +208,14 @@ def main() -> None:
     print(f"[{TAG}/{ARM}] gpqa acc={hit.mean():.4f} n={len(hit)}", flush=True)
     pw = nll(llm)
     print(f"[{TAG}/{ARM}] nll={np.mean(pw):.5f} over {len(pw)} windows", flush=True)
-    tp = throughput(llm)
-    warm = [r["out_tok_per_s"] for r in tp[1:]] or [tp[0]["out_tok_per_s"]]
+    # `REPEATS=0` drops the rate phase, which is what the quality jobs want: this script's
+    # throughput goes through the default all-to-all, whose volume does not depend on
+    # per-token fan-out, so there is nothing here for the kernel to save and `serve_run.py`
+    # is the rate measurement. It also used to take the quality numbers down with it - the
+    # artefact is written after this phase, and the phase crashes flashinfer's MNNVL
+    # symmetric memory on this image.
+    tp = throughput(llm) if REPEATS else []
+    warm = [r["out_tok_per_s"] for r in tp[1:]] or [r["out_tok_per_s"] for r in tp]
 
     OUT.mkdir(exist_ok=True)
     (OUT / f"vllm_{TAG}_{ARM}_r{REP}.json").write_text(json.dumps({
@@ -232,7 +238,7 @@ def main() -> None:
         # autotune, which is a real cost but not the one being compared. `compare.py` reads
         # the list, not the median, so the arm gap is tested against this spread.
         "warm_tok_per_s": warm,
-        "out_tok_per_s": float(np.median(warm)),
+        "out_tok_per_s": float(np.median(warm)) if warm else None,
     }, indent=1) + "\n")
     print(f"WROTE {OUT}/vllm_{TAG}_{ARM}_r{REP}.json", flush=True)
 
