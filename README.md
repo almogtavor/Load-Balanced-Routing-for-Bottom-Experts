@@ -6,10 +6,11 @@ four MoE families - three of them inside vLLM, the fourth offline only.
 
 A token routed to top-8 of a few hundred experts in an expert-parallel deployment usually has
 to be sent to *every* GPU, because eight experts drawn from that many rarely share a device.
-The all-to-all dispatch costs one copy of the token per destination GPU. Published ablations
-find the selection is not uniformly important - the top few experts carry the result and the
-bottom ones can be substituted with little accuracy loss - so the bottom slots are free
-parameters, and there is an obvious thing to spend them on:
+The all-to-all dispatch costs one copy of the token per destination GPU. The selection is not
+uniformly important - the top few experts carry the result and the bottom ones can be
+substituted with little accuracy loss (arXiv 2412.00099, which also does the restricted-set
+reroute this rule reuses; see [the literature](#where-this-sits-in-the-literature)) - so the
+bottom slots are free parameters, and there is an obvious thing to spend them on:
 
 > Keep the top `keep` experts by router score. The *allowed set* is every expert living on a
 > GPU that those `keep` already require. Fill the remaining `top_k - keep` slots from the
@@ -75,9 +76,20 @@ where its premise fails would be measured as free and serve garbage.
 Three results, and they separate cleanly. **The plugin is free to run**: `keep = top_k` asks
 for no substitution, and across two engine loads it comes out at +0.22% throughput. **The rule
 costs real accuracy** below `keep=6`, resolved at 3 sigma on both Qwen families. **Nothing is
-faster, anywhere measured** - every arm lands between 0 and -5%, and
+faster in any configuration measured so far** - every arm lands between 0 and -5%, and
 [why a smaller payload is not a faster step](#why-a-smaller-payload-is-not-a-faster-step) is
-what the evidence says about that.
+what the evidence says about that. That claim is scoped to one measurement condition: under
+data parallelism vLLM caps the scheduler at 256 tokens per step, not the usual 2048
+(`DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP`, applied in `arg_utils.py` whenever the flag
+is unset), so every serve run in the table below chunked its prompts into 256-token steps and
+the dispatch payload per all-to-all stayed small however many requests were in flight. A rule
+that shrinks payload and not per-collective latency cannot show there. `BATCH_TOK` now passes
+the budget explicitly and every artefact records it, and the re-measurement at a real budget
+is in: `q30pf`, 32 requests of 4096 prompt tokens at `--max-num-batched-tokens 8192`, ep=4 on
+one host, three base launches. It did not change the sign. `keep=4` is **-3.16%** and `keep=2`
+**-5.43%** against a base spread of **0.64%** - a tighter instrument than the capped runs ever
+gave, and the loss is now resolved rather than inside the noise. The budget was a real defect
+in the measurement and not the reason the saving does not convert.
 
 An earlier set of throughput numbers was withdrawn, and the fix for it is why the control arm
 above is clean. vLLM pads a batch for cudagraph and data-parallel capture and marks the padding
@@ -177,7 +189,12 @@ dispatch volume *is* per-token fan-out. vLLM 0.31 only builds it under data para
 needs one process per rank - so this arm runs through a real `vllm serve`
 (`experiments/serve_run.py`, the `dp` tags). Four GPUs, `dp=2 tp=2`, so `ep_size=4`;
 `deepep_high_throughput`; 256 requests at 1024 prompt / 128 generated, except `gmdec`, which is
-a decode-dominant 16 at 128/512.
+a decode-dominant 16 at 128/512, and `q30pf`, which is 32 at 4096/8. The first four rows ran at
+vLLM's batched-DP default of **256 tokens per step**, which is the dispatch payload per
+all-to-all and therefore the ceiling on what this rule can move - see the scope note above.
+`q30pf` is the same hardware and backend with the budget set to 8192 instead, so it is the row
+to read; the capped four are the launch-bound regime, kept because they are what the earlier
+claims were made on.
 
 Out-tok/s against that same launch's own base arms, median of the warm repeats
 (`experiments/paired.py`):
@@ -188,6 +205,7 @@ Out-tok/s against that same launch's own base arms, median of the warm repeats
 | Qwen3-30B-A3B | 2 | -3.60% | -2.85% | -3.56% | -0.74% | 1.8-3.8% | +7-8% |
 | Qwen3.5-35B | 2 | -4.15% | -1.66% | -0.70% | -1.60% | 0.6-3.0% | ~0% |
 | Gemma, decode-heavy | 1 | +1.95% | - | +1.65% | +0.62% | 2.7% | +0.7% |
+| Qwen3-30B-A3B, prefill-first, 8192-token steps | 1 (3 bases) | - | - | **-3.16%** | **-5.43%** | **0.64%** | -3.0% |
 
 Read the no-op column first, because it is the instrument. On Gemma it is +0.22%: the plugin
 costs nothing measurable to run, and the keep arms there are the rule and nothing else. On both
@@ -197,9 +215,11 @@ for no substitution cannot cost more than substituting - so those two rows resol
 puts its resolution floor above every effect in the table. And the decode-heavy row's positive
 arms are a single launch whose largest number is the no-op control: noise with a sign.
 
-That leaves one usable row, and it is negative: `keep=6` at -0.62% is inside the base spread,
-`keep=4` at -4.41% and `keep=2` at -5.00% are outside it. The rule is real here, and it is a
-slowdown.
+That leaves two usable rows, and both are negative. Gemma: `keep=6` at -0.62% is inside the
+base spread, `keep=4` at -4.41% and `keep=2` at -5.00% are outside it. `q30pf`, at a real token
+budget and with three base launches agreeing to 0.64%, is the cleanest measurement in this repo
+and says the same thing with a tenth of the noise: -3.16% at `keep=4`, -5.43% at `keep=2`. The
+rule is real here, and it is a slowdown.
 
 A launch is the unit of analysis, not a repeat. An unmodified engine loaded twice measured
 +5.4% and +5.9% against itself across launches, so only within-launch ratios against that
@@ -241,9 +261,20 @@ Three things finish the explanation:
   node count, not EP width: at N nodes it is exactly the rank saving at `ep=N`
   (`experiments/fanout.py` prints -5.9% at 2 nodes, -24.3% at 4, -37.5% at 8). Widening EP
   inside the same two hosts puts everything the rule gains on NVLink.
-* **The step was not bandwidth-bound.** vLLM's own log on these runs: `DeepEP: Disabling CUDA
-  Graphs since DeepEP high-throughput kernels are optimized for prefill`. A launch-bound step
-  does not speed up when a resource that was not the bottleneck gets cheaper.
+* **The step was not bandwidth-bound, and part of that was the harness.** `T_comm` is roughly
+  `L + V/B_eff`: the rule moves `V`, never `L`. At the 256-token budget most of these runs
+  inherited, `V` per dispatch is 256 rows of hidden state - order a megabyte at these hidden
+  sizes, which NVLink clears in single-digit microseconds against a per-collective floor of
+  tens. `L` dominated by construction, so no change in `V` could register. The engine's own
+  hint says the same - `DeepEP: Disabling CUDA Graphs since DeepEP high-throughput kernels are
+  optimized for prefill`.
+* **Lifting the budget does not fix that, because it skips the regime entirely.** `q30pf` runs
+  the same ep=4 host at 8192 tokens per step on 4096-token prompts, and `keep=4` still loses
+  3.16%. A 32x4096-token prefill step is GEMM-bound, not link-bound: small steps are
+  latency-bound and large ones are compute-bound, and on a single host there is no budget in
+  between where NVLink is the constraint. The payload saving can only convert where the link is
+  slow enough to matter, which means across nodes over RDMA - the shape the tier note above
+  describes, and the one we cannot currently schedule.
 * **Compute is untouched by construction.** The rule changes *which* rank holds a token's
   expert, never how many experts it has, so the `sum_t k` expert-token GEMM pairs are identical
   in every arm. Nothing is removed from the only part of the step that scales with the model.
@@ -308,6 +339,30 @@ a forward pass. The offline sweep replays recorded routing through one hand-buil
 expert-parallel layer over NCCL `all_to_all_single` and times the collective itself across a
 batch sweep, which is the only way to see the mechanism. It is a model of serving, not serving;
 the pair is the point.
+
+## Where this sits in the literature
+
+The rule is not new. Stated plainly:
+
+* **The method has prior art.** *Mixture of Cache-Conditional Experts* (arXiv 2412.00099)
+  keeps the top `J` of a top-k selection by score and fills the rest from a restricted allowed
+  set, training-free and at inference time, including hard-reroute variants. Its `J` is
+  literally our `keep`. The only thing that differs is what the allowed set is conditioned on:
+  cache residency there, expert-to-GPU placement here. Anyone reading this as a new routing
+  rule is reading it wrong.
+* **The communication objective has prior art too, but it is not training-free.** C2R
+  (arXiv 2504.01337) and Occult (arXiv 2505.13345) both bias routing toward fewer destination
+  devices and both get there by changing the model - SFT in the first, modified fine-tuning in
+  the second. The training-free version of that objective is what is left over.
+* **What we claim is left.** No prior work we found measures this exact bias's quality cost at
+  inference with the weights frozen, across families, against a random-substitution control;
+  and none of it is a kernel inside a served engine with the throughput conversion measured
+  rather than counted. Both of those are in this repo, and the throughput half currently says
+  the saving does not convert - see above.
+
+The premise the rule rests on - that the top few experts carry the result and the tail is
+substitutable - is also 2412.00099's ablation, not ours. We re-measure it here because it is
+load-bearing, not because it was in doubt.
 
 ## What keeps it honest
 

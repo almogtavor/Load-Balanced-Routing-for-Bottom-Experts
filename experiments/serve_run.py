@@ -206,9 +206,13 @@ def main() -> None:
         tp = throughput(prompts)
     finally:
         kill(p)
-    # Repeat 0 pays for CUDA graph capture and the first all-to-all handshake, which is a
-    # launch cost, not a routing one.
-    warm = tp[1:] or tp[:1]
+    # Early repeats pay for CUDA graph capture and the first all-to-all handshake, which is a
+    # launch cost, not a routing one. How many is not fixed: at a 4096-token prompt the second
+    # repeat was still half rate, so the cut is "slower than 80% of the fastest repeat" rather
+    # than a hard `tp[1:]`. The headline is a median and survived either way; the decay
+    # diagnostic beside it did not, and read -40% when a cold repeat stayed in the set.
+    top = max(r["out_tok_per_s"] for r in tp)
+    warm = [r for r in tp if r["out_tok_per_s"] >= 0.8 * top] or tp[-1:]
     med = lambda k: float(np.median(v)) if (v := [r[k] for r in warm if r[k] is not None]) else None
 
     OUT.mkdir(exist_ok=True)
@@ -220,7 +224,7 @@ def main() -> None:
         "written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "tag": TAG, "model": MODEL, "arm": ARM, "keep": keep, "n_gpus": N_GPUS,
         "vllm": __import__("vllm").__version__, "a2a": A2A, "dp": DP * NODES, "tp": N_GPUS // DP,
-        "nodes": NODES, "ep_size": DP * NODES,
+        "nodes": NODES, "ep_size": N_GPUS * NODES,
         "n_req": N_REQ, "prompt_len": PROMPT_LEN, "gen_len": GEN_LEN,
         "batch_tok": BATCH_TOK, "max_len": MAX_LEN,
         "throughput": tp, "warm_tok_per_s": [r["out_tok_per_s"] for r in warm],
