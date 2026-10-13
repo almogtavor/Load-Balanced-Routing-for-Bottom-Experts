@@ -27,6 +27,17 @@
 # does not overwrite it behind your back:
 #
 #   oc cp . <pod>:/results/par
+#
+# On CoreWeave the same step is `kubectl cp`, and the claim carries the weights too:
+#
+#   KCTL='kubectl --context=waldorf_US-EAST-04A -n almogtavor-dev' TPL=job-cw.yaml \
+#     NS=almogtavor-dev CLAIM=par-cw BAD=gd91fda ./launch.sh NAME=q30mn TAG=q30mn \
+#     MODEL=/results/models/q30 NODES=4 GPUS=1 DP=1 MEM=200Gi \
+#     SERVE=1 A2A=deepep_high_throughput ARMS=base,base2,4,base3
+#
+# `BAD` is per-cluster, so pass it: the default names the two unusable OpenShift hosts. Four
+# arms rather than six because only `keep=4` has a predicted RDMA saving at ep=4, and three
+# base launches measure the launch-to-launch spread it has to clear.
 set -euo pipefail
 
 : "${NAME:=}" ; : "${TAG:=}" ; : "${MODEL:=}"
@@ -36,6 +47,11 @@ set -euo pipefail
 : "${N_REQ:=256}" ; : "${PROMPT_LEN:=1024}" ; : "${GEN_LEN:=128}" ; : "${REPEATS:=6}"
 : "${NODES:=1}" ; : "${BAD:=pokprod-b93r43s1, pokprod-b93r38s0}"
 : "${ARMS:=}" ; : "${IMG:=v0.31.0}" ; : "${A2A:=}" ; : "${SERVE:=0}" ; : "${DP:=2}" ; : "${REPS:=1}" ; : "${REP0:=0}"
+# Which cluster. The defaults are the OpenShift one, whose template carries its namespace and
+# model PVCs as literals; `TPL=job-cw.yaml` is the CoreWeave multi-node shape, which takes
+# both as variables because neither pre-exists there.
+: "${KCTL:=oc}" ; : "${TPL:=job.yaml}"
+: "${NS:=llm-d-pic}" ; : "${CLAIM:=kvcache-bench-results-almogtavor}"
 
 for kv in "$@"; do export "${kv?}"; done
 [ -n "${NAME}" ] && [ -n "${TAG}" ] && [ -n "${MODEL}" ] || {
@@ -44,10 +60,10 @@ for kv in "$@"; do export "${kv?}"; done
 # `nodeSelector: {${NODE}}`, so the pin is a whole `key: value` pair, not just a hostname.
 NODE="${NODE:+kubernetes.io/hostname: ${NODE}}"
 export NAME TAG MODEL GPUS MEM TF4 TFVER BATCH NWIN KEEPS STREAM TOKREF NODE ARMS IMG A2A SERVE DP REPS REP0
-export NODES BAD
+export NODES BAD NS CLAIM
 export N_REQ PROMPT_LEN GEN_LEN REPEATS
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-oc delete job "par-${NAME}" --ignore-not-found >/dev/null
-envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $ARMS $IMG $A2A $SERVE $DP $REPS $REP0 $N_REQ $PROMPT_LEN $GEN_LEN $REPEATS $NODES $BAD' \
-  < "${here}/job.yaml" | oc apply -f -
+${KCTL} delete job "par-${NAME}" --ignore-not-found >/dev/null
+envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $ARMS $IMG $A2A $SERVE $DP $REPS $REP0 $N_REQ $PROMPT_LEN $GEN_LEN $REPEATS $NODES $BAD $NS $CLAIM' \
+  < "${here}/${TPL}" | ${KCTL} apply -f -
 echo "launched par-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} tf4=${TF4} arms=${ARMS:-offline} a2a=${A2A:-default} serve=${SERVE} dp=${DP} reps=${REPS} rep0=${REP0} shape=${N_REQ}x${PROMPT_LEN}/${GEN_LEN} nodes=${NODES} ep=$(( DP * NODES ))"
