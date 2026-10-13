@@ -187,8 +187,8 @@ def throughput(prompts: list[list[int]]) -> list[dict]:
 def main() -> None:
     # `4` is keep=4; `4a0.5` is keep=4 with the load penalty. Both in the arm name so a sweep
     # needs no extra variable to carry them, and one filename still identifies the run.
-    k, _, a = ARM.partition("a")
-    keep = None if ARM.startswith("base") else int(k)
+    k, _, a = ("", "", "") if ARM.startswith("base") else ARM.partition("a")
+    keep = None if k == "" else int(k)
     alpha = float(a) if a else 0.0
     if keep is None:
         os.environ.pop("PAR_KEEP", None)

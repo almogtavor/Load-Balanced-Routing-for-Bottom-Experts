@@ -188,8 +188,8 @@ def throughput(llm) -> list[dict]:
 def main() -> None:
     # `4` is keep=4; `4a0.5` adds the load penalty, which changes *which* experts are picked
     # and so has to come through the quality arms too, not just the rate ones.
-    k, _, a = ARM.partition("a")
-    keep = None if ARM.startswith("base") else int(k)
+    k, _, a = ("", "", "") if ARM.startswith("base") else ARM.partition("a")
+    keep = None if k == "" else int(k)
     alpha = float(a) if a else 0.0
     # The plugin reads this in every worker at load time. Setting it here rather than outside
     # keeps the arm name and the engine's actual configuration from drifting apart.
