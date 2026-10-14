@@ -31,24 +31,34 @@ predicts](runs/speedup.png)
 is also the arm every claim here is compared against. `PLACEMENT_LOAD_PENALTY` is the second one, defaulting
 to `0`: it charges each substituted slot that much per expert slot already placed on its
 destination rank, which flattens the load the plain rule piles onto the busiest rank at no cost
-in volume. It is worth setting wherever the router is skewed - see
-[which of the two savings is real](#which-of-the-two-savings-is-real).
+in volume.
+
+**Start at `PLACEMENT_KEEP=6 PLACEMENT_LOAD_PENALTY=1`.** That is the arm where every measured
+quantity moves the right way at once: `keep=6` is the deepest substitution this repo cannot
+distinguish from stock on paired NLL ([what the rule costs in
+quality](#what-the-rule-costs-in-quality)), and at `load_penalty=1` it removes 9-21% of the
+dispatch pairs and 1-3% of what the busiest rank receives while spreading expert slots
+*flatter* than stock routing does ([the same measurement on a trained
+router](#the-same-measurement-on-a-trained-router-inside-the-engine)). Lower `keep` buys
+roughly twice the volume at `keep=4` and three times at `keep=2`, and both are resolved
+quality regressions on the Qwen families - worth it only if the all-to-all is the measured
+bottleneck.
 
 ```bash
 docker build -t placement-router-vllm:v0.31.0 -f docker/Dockerfile .
-docker run --gpus all -e PLACEMENT_KEEP=2 placement-router-vllm:v0.31.0 \
+docker run --gpus all -e PLACEMENT_KEEP=6 -e PLACEMENT_LOAD_PENALTY=1 placement-router-vllm:v0.31.0 \
   --model Qwen/Qwen3-30B-A3B --tensor-parallel-size 4 --enable-expert-parallel
 ```
 
 ```bash
-helm install placement-router helm/placement-router --set keep=2 --set gpus=4 --set model=Qwen/Qwen3-30B-A3B
+helm install placement-router helm/placement-router --set keep=6 --set loadPenalty=1 --set gpus=4 --set model=Qwen/Qwen3-30B-A3B
 ```
 
 Or into an existing environment, against any vLLM 0.31 install:
 
 ```bash
 pip install --no-deps -e .   # registers the `vllm.general_plugins` entry point
-PLACEMENT_KEEP=2 vllm serve <model> --tensor-parallel-size 4 --enable-expert-parallel
+PLACEMENT_KEEP=6 PLACEMENT_LOAD_PENALTY=1 vllm serve <model> --tensor-parallel-size 4 --enable-expert-parallel
 ```
 
 ## How it hooks in

@@ -25,6 +25,8 @@ spec:
           env:
             - name: PLACEMENT_KEEP
               value: {{ .Values.keep | quote }}
+            - name: PLACEMENT_LOAD_PENALTY
+              value: {{ .Values.loadPenalty | quote }}
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef: {name: {{ .Values.hfTokenSecret }}, key: HF_TOKEN}

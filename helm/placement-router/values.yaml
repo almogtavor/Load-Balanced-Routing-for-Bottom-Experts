@@ -8,7 +8,13 @@ model: Qwen/Qwen3-30B-A3B
 # How many of the top-k picks are chosen by score. The rest are re-placed onto ranks the head
 # already forces a visit to. Empty string is stock vLLM routing, which is the arm every claim
 # about this chart has to be compared against.
-keep: "2"
+keep: "6"
+
+# Charged per expert slot already placed on a substitute's destination rank. 0 is the plain
+# rule, which minimises dispatch volume alone and leaves the busiest rank holding more expert
+# slots than stock routing gives it. 1 fixes that at no cost in volume and is already
+# saturated - see `runs/loadpen.md`.
+loadPenalty: "1"
 
 # Expert parallelism is the whole point: the rule shrinks the all-to-all, so without
 # `--enable-expert-parallel` there is nothing to shrink. GPUs must equal the EP size, and the
