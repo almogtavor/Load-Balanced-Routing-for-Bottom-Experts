@@ -95,6 +95,8 @@ spec:
         # Non-empty switches run.sh to the vLLM path: one engine per listed arm, in order.
         - {name: ARMS, value: "${ARMS}"}
         - {name: SCRIPT, value: "${SCRIPT}"}
+        # load_penalty values the in-engine probe scores each keep at.
+        - {name: PENS, value: "${PENS}"}
         - {name: REPS, value: "${REPS}"}
         - {name: REP0, value: "${REP0}"}
         # The all-to-all backend. Empty leaves vLLM's default (`allgather_reducescatter`),

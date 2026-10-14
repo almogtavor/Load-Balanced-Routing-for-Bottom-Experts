@@ -171,9 +171,32 @@ def _k0():
 
 
 def install() -> None:
-    """Wrap stock `FusedTopKRouter._compute_routing` read-only. Loaded by `plugin.register()`
-    inside each worker; patching from the driver process would never reach the model."""
+    """Wrap the stock routing units read-only. Loaded by `plugin.register()` inside each
+    worker; patching from the driver process would never reach the model."""
+    from vllm.model_executor.layers.fused_moe.router.custom_routing_router import (
+        CustomRoutingRouter)
     from vllm.model_executor.layers.fused_moe.router.fused_topk_router import FusedTopKRouter
+
+    from placement_router.plugin import _LOGIT_TOPK
+
+    # Gemma routes through a function in its own model file rather than the fused unit, so it
+    # needs a second wrapper. Only a listed function ranks by gate logit alone, which is the
+    # rule's premise; anything else is declined rather than assumed equivalent.
+    custom_inner = CustomRoutingRouter._compute_routing
+
+    def _custom_routing(self, hidden_states, router_logits, indices_type, **kw):
+        out = custom_inner(self, hidden_states, router_logits, indices_type, **kw)
+        name = getattr(self.custom_routing_function, "__qualname__", "?")
+        if name not in _LOGIT_TOPK:
+            _decline(f"custom routing function {name}")
+        elif self.eplb_state is not None:
+            _decline("EPLB breaks the expert-to-rank map")
+        else:
+            _TOPK[0] = self.top_k
+            probe(router_logits, out[1], self.top_k)
+        return out
+
+    CustomRoutingRouter._compute_routing = _custom_routing
 
     inner = FusedTopKRouter._compute_routing
 
