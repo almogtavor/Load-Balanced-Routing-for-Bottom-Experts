@@ -1,5 +1,5 @@
 apiVersion: v2
-name: par
+name: placement-router
 description: vLLM with the placement-aware MoE router
 type: application
 version: 0.1.0

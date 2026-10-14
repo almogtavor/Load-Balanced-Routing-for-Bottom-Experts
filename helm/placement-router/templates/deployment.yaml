@@ -23,7 +23,7 @@ spec:
             - {{ . | quote }}
 {{- end }}
           env:
-            - name: PAR_KEEP
+            - name: PLACEMENT_KEEP
               value: {{ .Values.keep | quote }}
             - name: HF_TOKEN
               valueFrom:

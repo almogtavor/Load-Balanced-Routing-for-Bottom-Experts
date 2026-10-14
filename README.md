@@ -23,39 +23,39 @@ The saving is purely communication, which is why it has to be measured rather th
 
 ## Using it
 
-`PAR_KEEP` is the knob. Unset, the plugin patches nothing and the image is stock vLLM - which
-is also the arm every claim here is compared against. `PAR_ALPHA` is the second one, defaulting
+`PLACEMENT_KEEP` is the knob. Unset, the plugin patches nothing and the image is stock vLLM - which
+is also the arm every claim here is compared against. `PLACEMENT_LOAD_PENALTY` is the second one, defaulting
 to `0`: it charges each substituted slot that much per expert slot already placed on its
 destination rank, which flattens the load the plain rule piles onto the busiest rank at no cost
 in volume. It is worth setting wherever the router is skewed - see
 [why a smaller payload is not a faster step](#why-a-smaller-payload-is-not-a-faster-step).
 
 ```bash
-docker build -t par-vllm:v0.31.0 -f docker/Dockerfile .
-docker run --gpus all -e PAR_KEEP=2 par-vllm:v0.31.0 \
+docker build -t placement-router-vllm:v0.31.0 -f docker/Dockerfile .
+docker run --gpus all -e PLACEMENT_KEEP=2 placement-router-vllm:v0.31.0 \
   --model Qwen/Qwen3-30B-A3B --tensor-parallel-size 4 --enable-expert-parallel
 ```
 
 ```bash
-helm install par helm/par --set keep=2 --set gpus=4 --set model=Qwen/Qwen3-30B-A3B
+helm install placement-router helm/placement-router --set keep=2 --set gpus=4 --set model=Qwen/Qwen3-30B-A3B
 ```
 
 Or into an existing environment, against any vLLM 0.31 install:
 
 ```bash
 pip install --no-deps -e .   # registers the `vllm.general_plugins` entry point
-PAR_KEEP=2 vllm serve <model> --tensor-parallel-size 4 --enable-expert-parallel
+PLACEMENT_KEEP=2 vllm serve <model> --tensor-parallel-size 4 --enable-expert-parallel
 ```
 
 ## How it hooks in
 
 vLLM v0.31 routes every fused-MoE layer through `BaseRouter._select_experts`, which validates
 EPLB state, delegates to a subclass `_compute_routing`, maps logical expert ids to physical and
-fixes the index dtype. `src/par/vendor/fused_topk_router.py` is that subclass vendored
+fixes the index dtype. `src/placement_router/vendor/fused_topk_router.py` is that subclass vendored
 verbatim from v0.31.0 with two imports and four lines changed: the Triton kernel in
-`src/par/kernel.py` *replaces* the fused top-k rather than running after it, so an arm spends
+`src/placement_router/kernel.py` *replaces* the fused top-k rather than running after it, so an arm spends
 the one launch per MoE layer stock vLLM also spends. Gemma routes through `CustomRoutingRouter`
-instead, so `src/par/plugin.py` wraps that method and substitutes the kernel for the model's
+instead, so `src/placement_router/plugin.py` wraps that method and substitutes the kernel for the model's
 own routing function, folding in its per-expert scale. The dispatch, the combine, the expert
 GEMMs and every other routing variant are untouched, which is the only reason this is safe to
 drop into a stock image.
@@ -64,7 +64,7 @@ Expert-to-rank needs no map tensor: vLLM shards experts in contiguous blocks, so
 `expert * ep_size // num_experts`, computed in the kernel.
 
 The router **passes the selection through unchanged, with one warning**, wherever the rule's
-premise does not hold. `_unsupported` in `src/par/plugin.py` is the whole list: a router class
+premise does not hold. `_unsupported` in `src/placement_router/plugin.py` is the whole list: a router class
 or custom routing function that does not rank by gate logits alone (grouped top-k, score
 correction, zero-expert routing - "the top `keep` by logit" would not be the head the router
 chose), a non-softmax `scoring_func` or routing without renormalization (the kernel's softmax
@@ -110,7 +110,7 @@ bias: a `-1` reaching Gemma's index scatter asserted out of bounds mid-run
 (`ScatterGatherKernel.cu:203`).
 
 The kernel now declines any row that is not `top_k` distinct in-range experts and returns it
-byte-for-byte, sentinel included; `src/par/kernel.py` asserts that on GPU before any arm runs.
+byte-for-byte, sentinel included; `src/placement_router/kernel.py` asserts that on GPU before any arm runs.
 That moved the no-op control from about -9% to +0.22%. The quality numbers were never affected
 - vLLM's fused MoE imposes no expert capacity, so a padded token routed by mistake costs time
 and takes nothing from a real token's output.
@@ -126,7 +126,7 @@ Dispatch volume is per-token GPU fan-out, and for uniform logits that is analyti
 holds `E/G` of the `E` experts, so a top-k drawn without replacement misses it with
 probability `prod_i (E-E/G-i)/(E-i)`, and a token touches `G (1 - p(k))` ranks. The rewrite
 makes a token's rank set its top-`keep`'s rank set, so the same expression at `n = keep` is
-the fan-out afterwards. `expected_fanout` in `src/par/kernel.py` is that formula, asserted
+the fan-out afterwards. `expected_fanout` in `src/placement_router/kernel.py` is that formula, asserted
 against the measured fan-out in the self-check:
 
 | `ep_size` | top-8 touches | `keep=6` | `keep=4` | `keep=2` |
@@ -248,7 +248,7 @@ and independent draws at 400 steps do not resolve that:
 | ranks taking part in the collective | 4.00 -> 4.00 | 4.00 -> 4.00 | 8.00 -> 8.00 | 8.00 -> 7.99 |
 | busiest rank's dispatch count | -22.1% | -11.4% | -34.6% | -20.8% |
 | busiest rank's **expert work** | +2.0% | **+11.1%** | +4.4% | **+22.3%** |
-| the same, at `PAR_ALPHA=1` | +1.1% | **-0.5%** | +3.0% | **+7.2%** |
+| the same, at `PLACEMENT_LOAD_PENALTY=1` | +1.1% | **-0.5%** | +3.0% | **+7.2%** |
 
 Two rows carry it. The participation row says the all-to-all is **one collective per layer per
 step over the whole in-flight batch**, not one per token: even 16 tokens at top-8 reach every
@@ -265,14 +265,14 @@ imbalance - **we shrink the sum and the step is set by the max**. The dispatch c
 discrepancy in one line, and an earlier version of this section read the first number as if it
 were the second.
 
-The last row is the fix, and it is the reason `PAR_ALPHA` exists. The kernel charges each tail
-pick `alpha` per expert slot already placed on that pick's rank. The tail stays confined to the
+The last row is the fix, and it is the reason `PLACEMENT_LOAD_PENALTY` exists. The kernel charges each tail
+pick `load_penalty` per expert slot already placed on that pick's rank. The tail stays confined to the
 head's ranks either way, so volume and busiest *dispatch* are unchanged by construction - the
 experiment asserts exact equality on both - and only *which* of those ranks a slot lands on
 moves. At `ep=4` skewed that converts +11.1% into -0.5%; at `ep=8` skewed it halves +22.3% to
-+7.2%. `ALPHA` is a `tl.constexpr` defaulting to `0.0`, which compiles the penalty away, so the
-plain rule pays nothing for the option. Unlike `keep`, `alpha` changes which experts are picked,
-so it needs its own quality measurement and gets its own arm name (`4a1` is `keep=4, alpha=1`).
++7.2%. `LOAD_PENALTY` is a `tl.constexpr` defaulting to `0.0`, which compiles the penalty away, so the
+plain rule pays nothing for the option. Unlike `keep`, `load_penalty` changes which experts are picked,
+so it needs its own quality measurement and gets its own arm name (`4p1` is `keep=4, load_penalty=1`).
 
 Three things finish the explanation:
 
@@ -303,7 +303,7 @@ Three things finish the explanation:
   GEMM pairs are identical in every arm. Nothing is removed from the only part of the step that
   scales with the model - and because that total is fixed while the busiest rank's share of it
   rises, the rule *adds* to the critical path exactly as much as it takes off the wire. That is
-  the expert-work row above, and `alpha` is what cancels it.
+  the expert-work row above, and `load_penalty` is what cancels it.
 
 The regime that would test the rule properly is more nodes. What the rule caps is *ranks* - a
 token reaches at most `keep` of them - and nodes fall only as a consequence, so there is no
@@ -322,10 +322,10 @@ nodes, -40.7% and -26.5% at 16.
 
 The imbalance follows the rule to that tier, though, and this is the part that qualifies the
 optimism above. Busiest node *work* rises +12.5% skewed over 4 nodes, +21.9% over 8 and +29.6%
-over 16 (iid: +1.9%, +4.2%, +6.8%). `alpha=1` only halves it there rather than erasing it -
+over 16 (iid: +1.9%, +4.2%, +6.8%). `load_penalty=1` only halves it there rather than erasing it -
 +4.6%, +12.7%, +22.5% - because the penalty can flatten the tail across the head's ranks but a
 node holds several of them, and the head chose the node. A node-level penalty is the obvious
-next lever and is not implemented: `src/par/kernel.py` optimises distinct *ranks* only.
+next lever and is not implemented: `src/placement_router/kernel.py` optimises distinct *ranks* only.
 
 Participation is invariant at the RDMA tier too, though (8.00 -> 8.00, 16.00 -> 16.00), so the
 per-collective floor is unchanged and a win needs the step to be RDMA-bandwidth-bound. Both
@@ -345,7 +345,7 @@ across tokens and layers in ways no synthetic draw reproduces.
 Three, because they fail in different ways.
 
 **In vLLM - `experiments/vllm_run.py`, `experiments/compare.py`.** A stock engine, four GPUs,
-expert-parallel, nothing swapped but the router. One process per arm, since `PAR_KEEP` is read
+expert-parallel, nothing swapped but the router. One process per arm, since `PLACEMENT_KEEP` is read
 when the engine loads. Throughput is wall clock for a fixed decode workload with `ignore_eos`
 and a fixed token batch, so no arm can look fast by doing less; accuracy is GPQA scored by
 option likelihood, paired per item. The honest resolution of the y axis is `base2` - the stock
@@ -425,9 +425,9 @@ MODEL=/models/qwen3-30b-a3b TAG=q30rh ARMS=base,base2,6,4,2,base3 experiments/ru
 python experiments/compare.py
 
 # the DeepEP shape, where the volume this shrinks is the volume the engine moves
-# `4a1` is keep=4 with the load penalty, which is the arm the critical-path finding asks for
+# `4p1` is keep=4 with the load penalty, which is the arm the critical-path finding asks for
 MODEL=/models/qwen3-30b-a3b TAG=q30dp SERVE=1 DP=2 A2A=deepep_high_throughput \
-  ARMS=base,base2,6,4,4a1,2,base3 experiments/run.sh
+  ARMS=base,base2,6,4,4p1,2,base3 experiments/run.sh
 python experiments/paired.py
 
 # no GPU: which tier the saving lands on, and whether anything on the critical path moves
@@ -459,8 +459,8 @@ hosts, which is the shape where the saving reaches the RDMA tier. Built, not yet
 
 | | |
 | --- | --- |
-| `src/par/kernel.py` | the rule: Triton kernel, torch reference, fan-out metric, self-check |
-| `src/par/plugin.py` | the vLLM hook and the guards that decline to apply it |
+| `src/placement_router/kernel.py` | the rule: Triton kernel, torch reference, fan-out metric, self-check |
+| `src/placement_router/plugin.py` | the vLLM hook and the guards that decline to apply it |
 | `docker/`, `helm/` | the stock serving image with the router swapped, and a chart for it |
 | `experiments/vllm_run.py` | one arm in real vLLM: GPQA and decode throughput |
 | `experiments/compare.py` | the vLLM figure and the paired statistics |

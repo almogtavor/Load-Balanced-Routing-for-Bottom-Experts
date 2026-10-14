@@ -1,5 +1,5 @@
 image:
-  repository: ghcr.io/almogtavor/par-vllm
+  repository: ghcr.io/almogtavor/placement-router-vllm
   tag: v0.31.0
   pullPolicy: IfNotPresent
 

@@ -4,8 +4,8 @@
 # Vendored verbatim from vLLM v0.31.0:
 #   vllm/model_executor/layers/fused_moe/router/fused_topk_router.py
 #
-# The only change is in `FusedTopKRouter._compute_routing`, marked `par:` below - two imports
-# and four lines that hand the routing to `par.kernel.select` instead of `fused_topk`, which
+# The only change is in `FusedTopKRouter._compute_routing`, marked `placement:` below - two imports
+# and four lines that hand the routing to `placement_router.kernel.select` instead of `fused_topk`, which
 # picks the top `keep` by logit and fills the rest from ranks the head already visits.
 # Everything else is upstream's, and the file is kept as a copy rather than a patch so
 # `git diff` against the upstream path is the whole story.
@@ -34,8 +34,8 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 
-from par.kernel import select                                               # par
-from par.plugin import ep_size, par_alpha, par_keep                         # par
+from placement_router.kernel import select                                               # placement
+from placement_router.plugin import ep_size, load_penalty, keep_for                         # placement
 
 
 def _get_padding_mask(num_tokens: int) -> torch.Tensor | None:
@@ -184,14 +184,14 @@ class FusedTopKRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using standard fused top-k."""
-        # par: the placement-aware kernel *is* the routing here, not a pass over its output,
-        # so this arm spends the one launch the fused top-k below would have spent. `par_keep`
+        # placement: the placement-aware kernel *is* the routing here, not a pass over its output,
+        # so this arm spends the one launch the fused top-k below would have spent. `keep_for`
         # is `None` - one attribute read - unless the rule's premise holds for this router.
-        keep = par_keep(self, router_logits)
+        keep = keep_for(self, router_logits)
         if keep is not None:
             return select(router_logits, self.top_k, keep, ep_size(),
                           _get_padding_mask(router_logits.shape[0]),
-                          indices_dtype=indices_type, alpha=par_alpha())
+                          indices_dtype=indices_type, load_penalty=load_penalty())
 
         topk_weights, topk_ids, token_expert_indices = fused_topk(
             hidden_states=hidden_states,

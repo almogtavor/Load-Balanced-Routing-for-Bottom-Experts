@@ -3,14 +3,14 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "par"
+name = "placement-router"
 version = "0.1.0"
 description = "Placement-aware router for the bottom experts of a top-k MoE, as a vLLM kernel"
 requires-python = ">=3.10"
 dependencies = ["torch"]
 
 [project.entry-points."vllm.general_plugins"]
-placement_aware_router = "par.plugin:register"
+placement_aware_router = "placement_router.plugin:register"
 
 [tool.setuptools.packages.find]
 where = ["src"]

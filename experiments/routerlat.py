@@ -4,7 +4,7 @@ The rule is slower in every serve measurement so far, and there are only two can
 explanations: the selection kernel costs more than the one it displaces, or the selection it
 produces costs more downstream. This separates them, because it times the selection alone.
 
-Stock vLLM spends one `topk_softmax` launch per MoE layer. `par.kernel.select` replaces it, so
+Stock vLLM spends one `topk_softmax` launch per MoE layer. `placement_router.kernel.select` replaces it, so
 the arms here are launch-for-launch comparable and the difference is the whole overhead the
 rule can possibly add at the router. Kernel launches are counted from the profiler rather than
 asserted, since "one launch" is the load-bearing claim and a stray `.contiguous()` or dtype
@@ -17,8 +17,8 @@ answer only in that there is none. If it matches stock, the kernel is not the ov
 """
 import torch
 
-from par.kernel import select
-from par.vendor.fused_topk_router import vllm_topk_softmax
+from placement_router.kernel import select
+from placement_router.vendor.fused_topk_router import vllm_topk_softmax
 
 E, K = 128, 8
 ITERS = 200
@@ -59,9 +59,9 @@ def main():
             return vllm_topk_softmax(w, i, x, lg, True)
 
         arms = [("stock topk_softmax", stock)]
-        for keep, alpha in ((8, 0.0), (4, 0.0), (4, 1.0)):
-            arms.append((f"select keep={keep} alpha={alpha}",
-                         lambda keep=keep, alpha=alpha: select(lg, K, keep, 4, alpha=alpha)))
+        for keep, load_penalty in ((8, 0.0), (4, 0.0), (4, 1.0)):
+            arms.append((f"select keep={keep} load_penalty={load_penalty}",
+                         lambda keep=keep, load_penalty=load_penalty: select(lg, K, keep, 4, load_penalty=load_penalty)))
         b = None
         for name, fn in arms:
             us, n = timed(fn), launches(fn)

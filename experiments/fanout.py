@@ -17,7 +17,7 @@ each one is a property of the selection alone:
           its *expert work* rises, because the substitute is the highest logit on a rank the
           head already visits and the head visits popular ranks. Total work is `B * K` in every
           arm, so a rise in that maximum is pure imbalance on the critical path. The kernel's
-          `alpha` charges a tail pick per slot already on its rank, which flattens that
+          `load_penalty` charges a tail pick per slot already on its rank, which flattens that
           maximum at the same volume - the last column.
 
 Logits here are iid Gaussian, with an optional skew to make expert choice non-uniform. This
@@ -31,10 +31,10 @@ import numpy as np
 E, K, T = 128, 8, 8192
 
 
-def sel_rank(lg, k, keep, g, alpha=0.0):
+def sel_rank(lg, k, keep, g, load_penalty=0.0):
     """The shipped rule: collapse the tail onto ranks the head already visits.
 
-    `alpha` is the kernel's load penalty: charge a tail pick that much per slot already placed
+    `load_penalty` is the kernel's load penalty: charge a tail pick that much per slot already placed
     on its rank. Same hot-rank restriction, so the same volume - it only changes which of those
     ranks the tail lands on. With a penalty the picks stop being independent, so this is
     `k - keep` argmaxes rather than one top-k, which is also what the kernel does.
@@ -47,13 +47,13 @@ def sel_rank(lg, k, keep, g, alpha=0.0):
     np.put_along_axis(hot, head * g // E, True, 1)
     z = np.where(hot[:, rank], lg, -np.inf).copy()
     np.put_along_axis(z, head, -np.inf, 1)
-    if not alpha or k <= keep:
+    if not load_penalty or k <= keep:
         return np.concatenate([head, np.argsort(-z, 1)[:, :k - keep]], 1)
     load = np.zeros((b, g))
     np.add.at(load, (np.arange(b)[:, None], head * g // E), 1.0)
     sub = []
     for _ in range(k - keep):
-        e = (z - alpha * load[:, rank]).argmax(1)
+        e = (z - load_penalty * load[:, rank]).argmax(1)
         sub.append(e)
         z[np.arange(b), e] = -np.inf
         load[np.arange(b), rank[e]] += 1
@@ -72,7 +72,7 @@ def cost(sel, g, gpn):
 def step(rng, g, arms, B, skew, gpn=1, steps=400):
     """Per-step volume, participation and busiest-destination load, one tier at a time.
 
-    `arms` is a list of `(keep, alpha)`, all scored on the *same* logit draw - the arms differ
+    `arms` is a list of `(keep, load_penalty)`, all scored on the *same* logit draw - the arms differ
     by a few percent and independent draws at this `steps` do not resolve that.
 
     `gpn=1` buckets by rank, which is the NVLink tier. Any larger `gpn` buckets ranks into
@@ -85,8 +85,8 @@ def step(rng, g, arms, B, skew, gpn=1, steps=400):
         lg = rng.standard_normal((B, E)).astype(np.float32)
         if skew:
             lg += skew * np.log(rng.gamma(0.4, 1.0, E) + 1e-6)
-        for i, (keep, alpha) in enumerate(arms):
-            dst = sel_rank(lg, K, keep, g, alpha) * g // E // gpn
+        for i, (keep, load_penalty) in enumerate(arms):
+            dst = sel_rank(lg, K, keep, g, load_penalty) * g // E // gpn
             vis = np.zeros((B, n), bool)
             np.put_along_axis(vis, dst, True, 1)
             # The last one is expert slots landing on the busiest destination. Summed over
@@ -104,7 +104,7 @@ def main():
     # same invariant the GPU self-check asserts, and it is what makes that arm a control.
     base = np.sort(np.argsort(-lg, 1)[:, :K], 1)
     assert (np.sort(sel_rank(lg, K, K, 4), 1) == base).all()
-    assert (np.sort(sel_rank(lg, K, K, 4, alpha=1.0), 1) == base).all()
+    assert (np.sort(sel_rank(lg, K, K, 4, load_penalty=1.0), 1) == base).all()
 
     print("Which tier the saving lands on (ep_size, gpus/node):")
     for g, gpn in ((4, 2), (8, 2), (8, 1), (16, 2)):
@@ -124,16 +124,16 @@ def main():
                           (8, 2, 256), (16, 2, 256), (16, 1, 256), (32, 2, 256)):
             (v8, u8, m8, w8), (v4, u4, m4, w4), (va, _, ma, wa) = step(
                 rng, g, [(8, 0.0), (4, 0.0), (4, 1.0)], B, skew, gpn)
-            # `alpha` keeps the tail on the head's ranks, so it moves neither the volume nor
+            # `load_penalty` keeps the tail on the head's ranks, so it moves neither the volume nor
             # the busiest rank's dispatch count - only which of those ranks the slots land on.
-            assert va == v4 and ma == m4, f"alpha moved volume {va} vs {v4}, max {ma} vs {m4}"
+            assert va == v4 and ma == m4, f"load_penalty moved volume {va} vs {v4}, max {ma} vs {m4}"
             dst = "ranks" if gpn == 1 else f"{g // gpn} nodes"
             print(f"  {lab:6} ep={g:<2} B={B:<4} over {dst:<8}"
                   f" volume {(v4 / v8 - 1) * 100:+6.1f}%"
                   f"   taking part {u8:5.2f} -> {u4:5.2f}"
                   f"   busiest dispatch {(m4 / m8 - 1) * 100:+6.1f}%"
                   f"   busiest work {(w4 / w8 - 1) * 100:+6.1f}%"
-                  f"   with alpha=1 {(wa / w8 - 1) * 100:+6.1f}%")
+                  f"   with load_penalty=1 {(wa / w8 - 1) * 100:+6.1f}%")
 
 
 if __name__ == "__main__":

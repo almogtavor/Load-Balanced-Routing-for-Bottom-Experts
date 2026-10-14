@@ -36,14 +36,17 @@ fi
 if [ -n "${ARMS:-}" ]; then
   # Installed from a copy, not from /results: the entry point has to be importable in every
   # worker process, and four jobs share that PVC path.
-  cp -r . /tmp/par
-  pip -q install --no-deps --no-build-isolation -e /tmp/par
+  cp -r . /tmp/placement-router
+  pip -q install --no-deps --no-build-isolation -e /tmp/placement-router
   # The Triton path has no CPU fallback to be checked against on a laptop, so the first thing
   # a GPU job does is prove it agrees with the reference on this hardware.
-  "${PY}" src/par/kernel.py
+  "${PY}" src/placement_router/kernel.py
   # SERVE=1 measures through a real `vllm serve` instead of the offline API, which is the
   # only way to reach the DeepEP dispatch - see the header of serve_run.py.
-  if [ "${SERVE:-0}" = "1" ]; then script=experiments/serve_run.py
+  # SCRIPT names a one-off measurement to run instead of the arm sweep (imbalance.py scores
+  # every arm inside one engine load, so it wants ARMS=<anything> only to enter this path).
+  if [ -n "${SCRIPT:-}" ]; then script="${SCRIPT}"
+  elif [ "${SERVE:-0}" = "1" ]; then script=experiments/serve_run.py
   else script=experiments/vllm_run.py; fi
   # `base` and `base2` are the same configuration launched twice, and on the first clean
   # sweep they disagreed by 5.3% while the warm repeats inside each launch spread 0.8%. So a
@@ -54,7 +57,7 @@ if [ -n "${ARMS:-}" ]; then
   # instead of overwriting its files.
   # Multi-node expert parallelism is one pod per node (an indexed Job), and only rank 0
   # benchmarks. The peers hold expert shards and route their own tokens, so they need the
-  # arm's PAR_KEEP too - the head publishes it to the shared PVC before each arm. A peer's
+  # arm's PLACEMENT_KEEP too - the head publishes it to the shared PVC before each arm. A peer's
   # engine dies when the head kills its own between arms, which is the restart signal.
   mkdir -p runs
   sent="runs/mn_${TAG}.arm"

@@ -10,12 +10,12 @@ the highest-scoring experts that live on ranks the head already forces a visit t
 collapses to `|ranks of the top keep|` and every destination stays one the token was already
 paying for.
 
-`alpha` is the correction for what that rule gets wrong. Summed volume is not what sets a step:
+`load_penalty` is the correction for what that rule gets wrong. Summed volume is not what sets a step:
 the all-to-all and the expert GEMM behind it both end when the *slowest rank* ends, and total
 expert work is `sum_t k` whatever `keep` is - so only its spread over ranks can move. Taking the
 highest logit on a hot rank piles the tail onto whichever rank the head already loaded most,
 and `experiments/fanout.py` measures the busiest rank's work rising 10-20% while the summed
-volume falls 24-52%. `alpha` charges each tail pick that much per slot already placed on its
+volume falls 24-52%. `load_penalty` charges each tail pick that much per slot already placed on its
 rank, which removes the imbalance at the same volume. It is a different selection, so unlike
 `keep` alone it has to be re-measured for quality, not just for rate.
 
@@ -59,7 +59,7 @@ def expected_fanout(n_picks: int, n_ranks: int, n_experts: int) -> float:
 
 
 def rewrite_torch(logits: torch.Tensor, topk_ids: torch.Tensor, keep: int,
-                  n_ranks: int, alpha: float = 0.0) -> torch.Tensor:
+                  n_ranks: int, load_penalty: float = 0.0) -> torch.Tensor:
     """The reference rewrite. `logits` is `[T, E]`, `topk_ids` is `[T, k]`.
 
     Rank is `e * G // E`, which is the map `determine_expert_map` gives rank `r` the experts
@@ -82,7 +82,7 @@ def rewrite_torch(logits: torch.Tensor, topk_ids: torch.Tensor, keep: int,
     # holds `E/G >= k` experts and at most `keep` of them are head, so the pool is never empty.
     pool = hot[:, rank] & ~taken
     z = logits.masked_fill(~pool, torch.finfo(logits.dtype).min)
-    if not alpha:
+    if not load_penalty:
         sub = z.topk(k - keep, dim=-1).indices
         return torch.cat([head, sub], dim=1).to(topk_ids.dtype)
     # With a load penalty the picks stop being independent: each one changes what the next
@@ -92,7 +92,7 @@ def rewrite_torch(logits: torch.Tensor, topk_ids: torch.Tensor, keep: int,
     rows = torch.arange(t, device=logits.device)
     sub = []
     for _ in range(k - keep):
-        pick = (z - alpha * load[:, rank]).argmax(-1)
+        pick = (z - load_penalty * load[:, rank]).argmax(-1)
         sub.append(pick)
         z[rows, pick] = torch.finfo(logits.dtype).min
         load[rows, rank[pick]] += 1
@@ -118,7 +118,7 @@ if triton is not None:
     def _par_select(logits_ptr, out_ptr, w_ptr, pad_ptr, scale_ptr, stride_lm, E,
                     K: tl.constexpr, KEEP: tl.constexpr, N_RANKS: tl.constexpr,
                     BLOCK_E: tl.constexpr, HAS_PAD: tl.constexpr, HAS_SCALE: tl.constexpr,
-                    ALPHA: tl.constexpr = 0.0):
+                    LOAD_PENALTY: tl.constexpr = 0.0):
         """Top-k and the placement-aware rewrite, in one pass over one token's logit row."""
         m = tl.program_id(0)
         offs = tl.arange(0, BLOCK_E)
@@ -142,8 +142,8 @@ if triton is not None:
             slot = tl.where(offs == e, i, slot)
             re = e * N_RANKS // E
             hot = hot | (1 << re)
-            if ALPHA != 0.0:
-                pen = pen + tl.where(rank == re, ALPHA, 0.0)
+            if LOAD_PENALTY != 0.0:
+                pen = pen + tl.where(rank == re, LOAD_PENALTY, 0.0)
 
         # The rest, drawn only from ranks the head already forces a visit to.
         on_hot = (((hot >> rank) & 1) == 1) & live
@@ -151,8 +151,8 @@ if triton is not None:
             e = tl.argmax(tl.where(on_hot & ~taken, z - pen, -float("inf")), axis=0)
             taken = taken | (offs == e)
             slot = tl.where(offs == e, KEEP + i, slot)
-            if ALPHA != 0.0:
-                pen = pen + tl.where(rank == e * N_RANKS // E, ALPHA, 0.0)
+            if LOAD_PENALTY != 0.0:
+                pen = pen + tl.where(rank == e * N_RANKS // E, LOAD_PENALTY, 0.0)
 
         zt = tl.where(taken, z, -float("inf"))
         p = tl.exp(zt - tl.max(zt, axis=0))
@@ -171,7 +171,7 @@ if triton is not None:
 
 def select(logits: torch.Tensor, k: int, keep: int, n_ranks: int,
            is_padding: torch.Tensor | None = None, scale: torch.Tensor | None = None,
-           indices_dtype: torch.dtype | None = None, alpha: float = 0.0):
+           indices_dtype: torch.dtype | None = None, load_penalty: float = 0.0):
     """`(gate weights, ids)`. Triton where it can run, the reference everywhere else.
 
     `is_padding` is vLLM's `[T]` bool mask of cudagraph/DP padding rows, `scale` an optional
@@ -188,11 +188,11 @@ def select(logits: torch.Tensor, k: int, keep: int, n_ranks: int,
                           w if scale is None else scale, logits.stride(0), e,
                           K=k, KEEP=keep, N_RANKS=n_ranks, BLOCK_E=triton.next_power_of_2(e),
                           HAS_PAD=is_padding is not None, HAS_SCALE=scale is not None,
-                          ALPHA=float(alpha), num_warps=4)
+                          LOAD_PENALTY=float(load_penalty), num_warps=4)
         # int32 in the kernel and the cast after: `topk_indices_dtype` is unsigned on some
         # backends, and -1 reinterprets there as the 4294967295 vLLM's own padding produces.
         return w, out.to(indices_dtype or torch.int32)
-    ids = rewrite_torch(logits, logits.topk(k, -1).indices, keep, n_ranks, alpha)
+    ids = rewrite_torch(logits, logits.topk(k, -1).indices, keep, n_ranks, load_penalty)
     w = gate_weights(logits, ids, renormalize=True)
     if scale is not None:
         w = w * scale[ids.long()].to(w.dtype)
@@ -224,16 +224,16 @@ def _check() -> None:
     devs = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
     assert abs(_fanout(base, G, E).float().mean() - expected_fanout(K, G, E)) < 0.02
 
-    for keep, alpha in ((K, 0.0), (6, 0.0), (4, 0.0), (2, 0.0), (4, 1.0), (2, 0.5)):
+    for keep, load_penalty in ((K, 0.0), (6, 0.0), (4, 0.0), (2, 0.0), (4, 1.0), (2, 0.5)):
         want = expected_fanout(keep, G, E)
         for dev in devs:
             zz, bb = z.to(dev), base.to(dev)
-            gw, got = select(zz, K, keep, G, alpha=alpha)
+            gw, got = select(zz, K, keep, G, load_penalty=load_penalty)
             sel = got.long().sort(-1).values
-            # The fan-out assertion below is the one that matters for `alpha`: a penalised
+            # The fan-out assertion below is the one that matters for `load_penalty`: a penalised
             # pick is still confined to the head's ranks, so the closed form is unchanged.
             assert torch.equal(sel,
-                               rewrite_torch(zz, bb, keep, G, alpha).long().sort(-1).values)
+                               rewrite_torch(zz, bb, keep, G, load_penalty).long().sort(-1).values)
             assert sel.diff(dim=-1).min() > 0, "repeated expert"
             assert bool((got.unsqueeze(2) == bb[:, :keep].unsqueeze(1)).any(1).all()), "head"
             f = _fanout(got, G, E).float().mean().item()
@@ -247,7 +247,7 @@ def _check() -> None:
             assert torch.allclose(gw, gate_weights(zz, got, renormalize=True), atol=1e-6), \
                 f"{dev} keep={keep} weights"
             sc = torch.rand(E, device=dev) + 0.5
-            sw, sids = select(zz, K, keep, G, scale=sc, alpha=alpha)
+            sw, sids = select(zz, K, keep, G, scale=sc, load_penalty=load_penalty)
             assert torch.equal(sids, got), f"{dev} keep={keep} scale changed the selection"
             assert torch.allclose(sw, gw * sc[got.long()], atol=1e-6), f"{dev} scale fold"
         # Gemma keeps its own gate and the plugin reproduces its weights rather than running
@@ -256,13 +256,13 @@ def _check() -> None:
         # renormalized over it, then scaled. The first three are `gate_weights` - the
         # renormalization divides out the denominator the mask changed - so only the scale is
         # folded on. If this stops holding, Gemma's path has to call the router's own function.
-        ids = rewrite_torch(z, base, keep, G, alpha)
+        ids = rewrite_torch(z, base, keep, G, load_penalty)
         scale = torch.rand(E) + 0.5
         probs = z.softmax(-1) * torch.nn.functional.one_hot(ids.long(), E).sum(-2)
         ref = (probs / probs.sum(-1, keepdim=True)).gather(1, ids.long()) * scale[ids.long()]
         w = gate_weights(z, ids, renormalize=True) * scale[ids.long()]
         assert torch.allclose(w, ref, atol=1e-6), "gemma scale fold"
-        print(f"  keep={keep} alpha={alpha} fan-out {_fanout(ids, G, E).float().mean():.3f} "
+        print(f"  keep={keep} load_penalty={load_penalty} fan-out {_fanout(ids, G, E).float().mean():.3f} "
               f"(expected {want:.3f})")
 
     if torch.cuda.is_available():
@@ -284,7 +284,7 @@ def _check() -> None:
         # `keep == top_k` carries the whole claim that the rule is free to install, so it is
         # checked against vLLM's own `topk_softmax` and not just against the reference.
         try:
-            from par.vendor.fused_topk_router import vllm_topk_softmax
+            from placement_router.vendor.fused_topk_router import vllm_topk_softmax
         except Exception:                                              # no vLLM on this box
             vllm_topk_softmax = None
         if vllm_topk_softmax is not None:
@@ -300,7 +300,7 @@ def _check() -> None:
             assert torch.allclose(w.gather(1, o), vw.gather(1, vo), atol=1e-6), "stock weights"
             print("  keep == top_k reproduces vLLM's own topk_softmax, ids and weights")
 
-    print(f"par.kernel: ok (triton {'present' if triton else 'absent'})")
+    print(f"placement_router.kernel: ok (triton {'present' if triton else 'absent'})")
 
 
 if __name__ == "__main__":

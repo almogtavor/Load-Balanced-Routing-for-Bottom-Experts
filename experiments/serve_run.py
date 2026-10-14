@@ -39,7 +39,7 @@ import numpy as np
 
 MODEL = os.environ["MODEL"]
 TAG = os.environ["TAG"]
-ARM = os.environ.get("ARM", "base")                   # base* | `keep` | `keep`a`alpha`
+ARM = os.environ.get("ARM", "base")                   # base* | `keep` | `keep`p`load_penalty`
 REP = os.environ.get("REP", "0")                      # which sweep; a launch is the unit
 N_GPUS = int(os.environ.get("GPUS", 4))
 DP = int(os.environ.get("DP", 2))
@@ -100,7 +100,7 @@ def cmdline() -> list[str]:
 
 def peer() -> None:
     """A non-head pod. Holds its expert shards and routes its own tokens - so it needs the
-    same `PAR_KEEP` - but measures nothing. Exits when the head kills its engine between
+    same `PLACEMENT_KEEP` - but measures nothing. Exits when the head kills its engine between
     arms, and `run.sh` restarts it for the next one."""
     cmd = cmdline()
     print("[peer] " + " ".join(cmd), flush=True)
@@ -185,19 +185,19 @@ def throughput(prompts: list[list[int]]) -> list[dict]:
 
 
 def main() -> None:
-    # `4` is keep=4; `4a0.5` is keep=4 with the load penalty. Both in the arm name so a sweep
+    # `4` is keep=4; `4p0.5` is keep=4 with the load penalty. Both in the arm name so a sweep
     # needs no extra variable to carry them, and one filename still identifies the run.
-    k, _, a = ("", "", "") if ARM.startswith("base") else ARM.partition("a")
+    k, _, a = ("", "", "") if ARM.startswith("base") else ARM.partition("p")
     keep = None if k == "" else int(k)
-    alpha = float(a) if a else 0.0
+    load_penalty = float(a) if a else 0.0
     if keep is None:
-        os.environ.pop("PAR_KEEP", None)
-        os.environ.pop("PAR_ALPHA", None)
+        os.environ.pop("PLACEMENT_KEEP", None)
+        os.environ.pop("PLACEMENT_LOAD_PENALTY", None)
     else:
-        os.environ["PAR_KEEP"] = str(keep)
-        os.environ["PAR_ALPHA"] = str(alpha)
-    print(f"[{TAG}/{ARM}] PAR_KEEP={os.environ.get('PAR_KEEP', '<unset>')} "
-          f"PAR_ALPHA={os.environ.get('PAR_ALPHA', '<unset>')} gpus={N_GPUS} "
+        os.environ["PLACEMENT_KEEP"] = str(keep)
+        os.environ["PLACEMENT_LOAD_PENALTY"] = str(load_penalty)
+    print(f"[{TAG}/{ARM}] PLACEMENT_KEEP={os.environ.get('PLACEMENT_KEEP', '<unset>')} "
+          f"PLACEMENT_LOAD_PENALTY={os.environ.get('PLACEMENT_LOAD_PENALTY', '<unset>')} gpus={N_GPUS} "
           f"dp={DP * NODES} (local {DP}) tp={N_GPUS // DP} nodes={NODES} rank={RANK} "
           f"a2a={A2A}", flush=True)
     if RANK:
@@ -229,7 +229,7 @@ def main() -> None:
         # silently beside a fresh one. A missing field fails loudly; a stale number does not.
         "rep": int(REP),
         "written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "tag": TAG, "model": MODEL, "arm": ARM, "keep": keep, "alpha": alpha,
+        "tag": TAG, "model": MODEL, "arm": ARM, "keep": keep, "load_penalty": load_penalty,
         "n_gpus": N_GPUS,
         "vllm": __import__("vllm").__version__, "a2a": A2A, "dp": DP * NODES, "tp": N_GPUS // DP,
         "nodes": NODES, "ep_size": N_GPUS * NODES,

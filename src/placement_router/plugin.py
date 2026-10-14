@@ -5,7 +5,7 @@ EPLB state, delegates to a subclass `_compute_routing`, maps logical expert ids 
 ones and fixes the index dtype. Every fused-MoE layer in the engine goes through it.
 
 Nearly every MoE model served by vLLM routes through `FusedTopKRouter`, and for those this
-plugin swaps in `par.vendor.fused_topk_router` - that same unit copied in with a four-line
+plugin swaps in `placement_router.vendor.fused_topk_router` - that same unit copied in with a four-line
 insert, where the kernel *replaces* the fused top-k rather than running after it. One Triton
 launch per MoE layer, exactly where stock vLLM also spends one, so nothing is added to the
 forward and `keep == top_k` is a control arm that costs nothing measurable.
@@ -17,7 +17,7 @@ launch too. The function is a softmax over every expert, masked to the selection
 renormalized over it - which is the selection-scoped softmax the kernel already emits - times
 a learned per-expert output scale, which the kernel takes as an argument and folds in.
 
-`PAR_KEEP` turns the whole thing on; unset, nothing is patched at all. Either path passes the
+`PLACEMENT_KEEP` turns the whole thing on; unset, nothing is patched at all. Either path passes the
 selection through unchanged, once with a warning, wherever the rule does not apply:
 
 * **EPLB** replicates experts across ranks, so expert id no longer implies a rank and the
@@ -38,10 +38,10 @@ from __future__ import annotations
 
 import os
 
-from par.kernel import select
+from placement_router.kernel import select
 
 _KEEP: int | None = None
-_ALPHA = 0.0
+_LOAD_PENALTY = 0.0
 _EP: int | None = None
 _MISS = object()
 _warned: set[str] = set()
@@ -50,11 +50,11 @@ _warned: set[str] = set()
 def _logger():
     from vllm.logger import init_logger
 
-    return init_logger("par")
+    return init_logger("placement-router")
 
 
 def _warn(why: str) -> None:
-    _once(why, "par: routing left unchanged - %s" % why, warn=True)
+    _once(why, "placement-router: routing left unchanged - %s" % why, warn=True)
 
 
 def _once(key: str, msg: str, warn: bool = False) -> None:
@@ -74,7 +74,7 @@ def ep_size() -> int:
     return _EP
 
 
-def par_keep(router, router_logits) -> int | None:
+def keep_for(router, router_logits) -> int | None:
     """`keep` if the rule applies to this router, `None` if it does not.
 
     Called from inside the routing unit, so per MoE layer per forward. Nothing `_unsupported`
@@ -82,7 +82,7 @@ def par_keep(router, router_logits) -> int | None:
     and the rank count are all fixed once the engine is up - so the answer is decided on the
     first forward and cached on the router. After that this is one dict lookup.
     """
-    k = router.__dict__.get("_par_keep", _MISS)
+    k = router.__dict__.get("_keep_for", _MISS)
     if k is not _MISS:
         return k
     k = _KEEP
@@ -95,20 +95,20 @@ def par_keep(router, router_logits) -> int | None:
             # At warning level on purpose: this is the one line that says the kernel is
             # actually running, and `logger.info` is below the root logger's level in a stock
             # vLLM image, so an info-level version of it is invisible exactly where it matters.
-            _once("active", "par: placement-aware routing active, keep=%d of top_k=%d, "
+            _once("active", "placement-router: placement-aware routing active, keep=%d of top_k=%d, "
                             "ep_size=%d" % (k, router.top_k, ep_size()), warn=True)
-    router._par_keep = k
+    router._keep_for = k
     return k
 
 
-def par_alpha() -> float:
-    """`PAR_ALPHA`: the load penalty charged per slot already placed on a tail pick's rank.
+def load_penalty() -> float:
+    """`PLACEMENT_LOAD_PENALTY`: the load penalty charged per slot already placed on a tail pick's rank.
 
     0.0 is the plain rule - minimise summed volume. Anything higher trades none of that volume
     (the tail stays confined to the head's ranks either way) for a flatter spread over them,
     which is what the step actually waits on. See the kernel docstring.
     """
-    return _ALPHA
+    return _LOAD_PENALTY
 
 
 def _shim_remote_code() -> None:
@@ -126,10 +126,20 @@ def _shim_remote_code() -> None:
 
 
 def register() -> None:
-    """vLLM `general_plugins` entry point. Idempotent, and a no-op without `PAR_KEEP`."""
-    global _KEEP, _ALPHA
+    """vLLM `general_plugins` entry point. Idempotent, and a no-op without `PLACEMENT_KEEP`."""
+    global _KEEP, _LOAD_PENALTY
     _shim_remote_code()
-    if os.environ.get("PAR_KEEP") is None:
+    # A measurement hook, loaded by path so nothing in this package depends on it. The model
+    # runs in worker *processes*; a monkeypatch applied in the driver never reaches them, so an
+    # in-engine probe has to be installed from here, which is where every worker arrives.
+    if (probe := os.environ.get("PLACEMENT_PROBE")):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("placement_probe", probe)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.install()
+    if os.environ.get("PLACEMENT_KEEP") is None:
         return
 
     from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
@@ -137,19 +147,19 @@ def register() -> None:
         CustomRoutingRouter)
     from vllm.model_executor.layers.fused_moe.router.fused_topk_router import FusedTopKRouter
 
-    from par.vendor.fused_topk_router import FusedTopKRouter as ParFusedTopKRouter
+    from placement_router.vendor.fused_topk_router import FusedTopKRouter as PlacementFusedTopKRouter
 
-    if getattr(BaseRouter, "_par_patched", False):
+    if getattr(BaseRouter, "_placement_patched", False):
         return
-    _KEEP = int(os.environ["PAR_KEEP"])
-    _ALPHA = float(os.environ.get("PAR_ALPHA", 0.0))
-    FusedTopKRouter._compute_routing = ParFusedTopKRouter._compute_routing
+    _KEEP = int(os.environ["PLACEMENT_KEEP"])
+    _LOAD_PENALTY = float(os.environ.get("PLACEMENT_LOAD_PENALTY", 0.0))
+    FusedTopKRouter._compute_routing = PlacementFusedTopKRouter._compute_routing
     CustomRoutingRouter._compute_routing = _gemma_compute_routing(
         CustomRoutingRouter._compute_routing)
-    BaseRouter._par_patched = True
+    BaseRouter._placement_patched = True
     # Only that the patch is in. Whether it *applies* is decided per router in the first
     # forward, and the expert-parallel group does not exist yet at plugin load time.
-    _logger().info("par: router patched, keep=%d alpha=%g", _KEEP, _ALPHA)
+    _logger().info("placement-router: router patched, keep=%d load_penalty=%g", _KEEP, _LOAD_PENALTY)
 
 
 def _gemma_compute_routing(inner):
@@ -166,7 +176,7 @@ def _gemma_compute_routing(inner):
     """
 
     def _compute_routing(self, hidden_states, router_logits, indices_type, *, input_ids=None):
-        keep = par_keep(self, router_logits)
+        keep = keep_for(self, router_logits)
         if keep is None:
             return inner(self, hidden_states, router_logits, indices_type,
                          input_ids=input_ids)
@@ -174,7 +184,7 @@ def _gemma_compute_routing(inner):
         # `functional_call` parameter substitution has to reach it.
         scale = self.custom_routing_function.__self__.per_expert_scale
         return select(router_logits, self.top_k, keep, ep_size(), scale=scale,
-                      indices_dtype=indices_type, alpha=_ALPHA)
+                      indices_dtype=indices_type, load_penalty=_LOAD_PENALTY)
 
     return _compute_routing
 

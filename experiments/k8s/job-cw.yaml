@@ -6,16 +6,16 @@
 # What differs from the OpenShift template, and why:
 #   - `rdma/ib`, not `rdma/roce_gdr`. CoreWeave's nodes advertise 64 IB devices each.
 #   - One volume, not five. The results claim carries the code *and* the weights, because
-#     there are no pre-populated model PVCs here; `par-stage` downloads into it once.
+#     there are no pre-populated model PVCs here; `placement-stage` downloads into it once.
 #   - No HF token. `serve_run.py` benchmarks on synthetic token ids and the checkpoint is
 #     ungated, so nothing reaches the Hub from inside the job.
 #   - No TF4 venv: that cluster fact does not apply here. `BAD` names a different host.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: par-${NAME}
+  name: placement-${NAME}
   namespace: ${NS}
-  labels: {app: par, owner: almogtavor}
+  labels: {app: placement-router, owner: almogtavor}
 spec:
   backoffLimit: 6
   # One pod per node, and the anti-affinity is what makes "per node" true - four pods packed
@@ -26,10 +26,10 @@ spec:
   completionMode: Indexed
   template:
     metadata:
-      labels: {app: par, owner: almogtavor, job: par-${NAME}}
+      labels: {app: placement-router, owner: almogtavor, job: placement-${NAME}}
     spec:
       restartPolicy: Never
-      subdomain: par-${NAME}
+      subdomain: placement-${NAME}
       affinity:
         # `gd91fda` is Ready but its kubelet cannot create a pod sandbox at all:
         # `/var/lib/cni/results` is out of space, so every attempt fails identically and the
@@ -42,7 +42,7 @@ spec:
               - {key: kubernetes.io/hostname, operator: NotIn, values: [${BAD}]}
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
-          - labelSelector: {matchLabels: {job: par-${NAME}}}
+          - labelSelector: {matchLabels: {job: placement-${NAME}}}
             topologyKey: kubernetes.io/hostname
       containers:
       - name: run
@@ -51,7 +51,7 @@ spec:
         args:
         - |
           set -xeuo pipefail
-          cd /results/par
+          cd /results/placement-router
           export PY=python3
           exec bash experiments/run.sh
         env:
@@ -70,7 +70,7 @@ spec:
         - {name: SERVE, value: "${SERVE}"}
         - {name: DP, value: "${DP}"}
         - {name: NODES, value: "${NODES}"}
-        - {name: HEAD, value: "par-${NAME}-0.par-${NAME}.${NS}.svc.cluster.local"}
+        - {name: HEAD, value: "placement-${NAME}-0.placement-${NAME}.${NS}.svc.cluster.local"}
         - {name: MODEL, value: "${MODEL}"}
         - {name: TAG, value: "${TAG}"}
         - {name: GPUS, value: "${GPUS}"}
@@ -128,11 +128,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: par-${NAME}
+  name: placement-${NAME}
   namespace: ${NS}
-  labels: {app: par, owner: almogtavor}
+  labels: {app: placement-router, owner: almogtavor}
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
-  selector: {job: par-${NAME}}
+  selector: {job: placement-${NAME}}
   ports: [{name: rpc, port: 5555}]

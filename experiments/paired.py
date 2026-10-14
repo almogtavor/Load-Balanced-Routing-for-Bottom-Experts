@@ -22,8 +22,8 @@ import statistics as st
 CUT = "2026-10-13T10:40"
 
 def arm_key(a):
-    """`4` is keep=4, `4a0.5` is keep=4 with the load penalty. Descending keep, ascending alpha."""
-    k, _, al = a.partition("a")
+    """`4` is keep=4, `4p0.5` is keep=4 with the load penalty. Descending keep, ascending load_penalty."""
+    k, _, al = a.partition("p")
     return -int(k), float(al or 0.0)
 
 

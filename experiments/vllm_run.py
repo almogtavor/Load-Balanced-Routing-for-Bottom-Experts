@@ -7,7 +7,7 @@ all-to-all, the stock expert GEMMs, with nothing swapped except `BaseRouter._sel
 What it reports is therefore the benefit an actual deployment gets, paid for at an actual
 accuracy, with no accounting left to argue about.
 
-`PAR_KEEP` is read once, in each worker, when the engine loads, so one arm is one process -
+`PLACEMENT_KEEP` is read once, in each worker, when the engine loads, so one arm is one process -
 hence one script per arm and `compare.py` to pair them up. Two things make the pairing fair:
 
 * **identical work per arm.** The throughput phase decodes a fixed token count with
@@ -42,7 +42,7 @@ import numpy as np
 
 MODEL = os.environ["MODEL"]
 TAG = os.environ["TAG"]
-ARM = os.environ.get("ARM", "base")                   # base* | `keep` | `keep`a`alpha`
+ARM = os.environ.get("ARM", "base")                   # base* | `keep` | `keep`p`load_penalty`
 REP = os.environ.get("REP", "0")                      # which sweep; a launch is the unit
 N_GPUS = int(os.environ.get("GPUS", 4))
 MAX_LEN = int(os.environ.get("MAX_LEN", 2048))
@@ -186,21 +186,21 @@ def throughput(llm) -> list[dict]:
 
 
 def main() -> None:
-    # `4` is keep=4; `4a0.5` adds the load penalty, which changes *which* experts are picked
+    # `4` is keep=4; `4p0.5` adds the load penalty, which changes *which* experts are picked
     # and so has to come through the quality arms too, not just the rate ones.
-    k, _, a = ("", "", "") if ARM.startswith("base") else ARM.partition("a")
+    k, _, a = ("", "", "") if ARM.startswith("base") else ARM.partition("p")
     keep = None if k == "" else int(k)
-    alpha = float(a) if a else 0.0
+    load_penalty = float(a) if a else 0.0
     # The plugin reads this in every worker at load time. Setting it here rather than outside
     # keeps the arm name and the engine's actual configuration from drifting apart.
     if keep is None:
-        os.environ.pop("PAR_KEEP", None)
-        os.environ.pop("PAR_ALPHA", None)
+        os.environ.pop("PLACEMENT_KEEP", None)
+        os.environ.pop("PLACEMENT_LOAD_PENALTY", None)
     else:
-        os.environ["PAR_KEEP"] = str(keep)
-        os.environ["PAR_ALPHA"] = str(alpha)
-    print(f"[{TAG}/{ARM}] PAR_KEEP={os.environ.get('PAR_KEEP', '<unset>')} "
-          f"PAR_ALPHA={os.environ.get('PAR_ALPHA', '<unset>')} gpus={N_GPUS} "
+        os.environ["PLACEMENT_KEEP"] = str(keep)
+        os.environ["PLACEMENT_LOAD_PENALTY"] = str(load_penalty)
+    print(f"[{TAG}/{ARM}] PLACEMENT_KEEP={os.environ.get('PLACEMENT_KEEP', '<unset>')} "
+          f"PLACEMENT_LOAD_PENALTY={os.environ.get('PLACEMENT_LOAD_PENALTY', '<unset>')} gpus={N_GPUS} "
           f"a2a={A2A or '<default>'}", flush=True)
 
     llm = engine()
@@ -224,7 +224,7 @@ def main() -> None:
         # silently beside a fresh one. A missing field fails loudly; a stale number does not.
         "rep": int(REP),
         "written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "tag": TAG, "model": MODEL, "arm": ARM, "keep": keep, "alpha": alpha,
+        "tag": TAG, "model": MODEL, "arm": ARM, "keep": keep, "load_penalty": load_penalty,
         "n_gpus": N_GPUS,
         "vllm": __import__("vllm").__version__, "a2a": A2A or "<default>",
         "n_req": N_REQ, "prompt_len": PROMPT_LEN, "gen_len": GEN_LEN,

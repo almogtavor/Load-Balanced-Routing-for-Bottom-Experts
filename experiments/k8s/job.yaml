@@ -9,13 +9,13 @@
 # needs it: its vendored `hunyuan.py` imports `is_torch_fx_available`, which transformers 5.x
 # removed. The Qwen models run on the image's own transformers. The vLLM arms (`ARMS`) do not
 # use it - vLLM 0.31 serves Hunyuan through the Transformers backend, which runs that same
-# vendored file inside each worker, so the missing symbol is shimmed in `par.plugin` instead.
+# vendored file inside each worker, so the missing symbol is shimmed in `placement_router.plugin` instead.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: par-${NAME}
+  name: placement-${NAME}
   namespace: llm-d-pic
-  labels: {app: par, owner: almogtavor}
+  labels: {app: placement-router, owner: almogtavor}
 spec:
   backoffLimit: 2
   # `NODES=1` (the default) renders a plain one-pod Job. Above that it is one pod per node,
@@ -27,12 +27,12 @@ spec:
   completionMode: Indexed
   template:
     metadata:
-      labels: {app: par, owner: almogtavor, job: par-${NAME}}
+      labels: {app: placement-router, owner: almogtavor, job: placement-${NAME}}
     spec:
       restartPolicy: Never
-      # Gives each pod the DNS name `par-${NAME}-<index>.par-${NAME}`, which is how the
+      # Gives each pod the DNS name `placement-${NAME}-<index>.placement-${NAME}`, which is how the
       # peers find rank 0 - the Service below publishes it before the pods are ready.
-      subdomain: par-${NAME}
+      subdomain: placement-${NAME}
       affinity:
         # Two hosts in this cluster have GPUs that are present but unusable - one reports
         # CUDA error 802 from the fabric manager, the other fails admission with "GPU is
@@ -45,7 +45,7 @@ spec:
               - {key: kubernetes.io/hostname, operator: NotIn, values: [${BAD}]}
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
-          - labelSelector: {matchLabels: {job: par-${NAME}}}
+          - labelSelector: {matchLabels: {job: placement-${NAME}}}
             topologyKey: kubernetes.io/hostname
       # Optional `NODE=<hostname>` pin. The packing scheduler is deterministic, so a node whose
       # GPU has fallen off the bus keeps being chosen and every retry fails the same way; the
@@ -58,7 +58,7 @@ spec:
         args:
         - |
           set -xeuo pipefail
-          cd /results/par
+          cd /results/placement-router
           export PY=python3
           if [ "${TF4}" = "1" ]; then
             pip -q install --no-cache-dir uv
@@ -94,6 +94,7 @@ spec:
         - {name: TF4, value: "${TF4}"}
         # Non-empty switches run.sh to the vLLM path: one engine per listed arm, in order.
         - {name: ARMS, value: "${ARMS}"}
+        - {name: SCRIPT, value: "${SCRIPT}"}
         - {name: REPS, value: "${REPS}"}
         - {name: REP0, value: "${REP0}"}
         # The all-to-all backend. Empty leaves vLLM's default (`allgather_reducescatter`),
@@ -107,7 +108,7 @@ spec:
         - {name: DP, value: "${DP}"}
         # Pods in this Job, i.e. nodes. The engine's dp size is DP * NODES; `HEAD` is rank 0.
         - {name: NODES, value: "${NODES}"}
-        - {name: HEAD, value: "par-${NAME}-0.par-${NAME}.llm-d-pic.svc.cluster.local"}
+        - {name: HEAD, value: "placement-${NAME}-0.placement-${NAME}.llm-d-pic.svc.cluster.local"}
         - {name: TFVER, value: "${TFVER}"}
         - {name: MODEL, value: "${MODEL}"}
         - {name: TAG, value: "${TAG}"}
@@ -164,11 +165,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: par-${NAME}
+  name: placement-${NAME}
   namespace: llm-d-pic
-  labels: {app: par, owner: almogtavor}
+  labels: {app: placement-router, owner: almogtavor}
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
-  selector: {job: par-${NAME}}
+  selector: {job: placement-${NAME}}
   ports: [{name: rpc, port: 5555}]
