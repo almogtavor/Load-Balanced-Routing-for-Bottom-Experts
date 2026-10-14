@@ -1,5 +1,4 @@
 runs/*
-!runs/vllm.png
 !runs/speedup.png
 !runs/speedup.md
 !runs/epscale.png
