@@ -4,4 +4,5 @@ runs/*
 !runs/speedup.md
 !runs/epscale.png
 !runs/epscale.md
+!runs/loadpen.md
 __pycache__/

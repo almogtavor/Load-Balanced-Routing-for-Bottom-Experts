@@ -64,6 +64,37 @@ def read(tag: str) -> dict[int, dict]:
     return out
 
 
+def loadpen() -> None:
+    """`runs/loadpen.md`: where the load penalty stops buying anything.
+
+    From a separate sweep of the same probe at `PENS=0,1,2,4,8`. Only the expert-slot column
+    moves - volume and busiest-rank receipts are bit-identical across penalties, because the
+    tail stays confined to the head's ranks either way - so that is the only one tabulated.
+    """
+    p = RUNS / "imbalance_imbpen_0.json"
+    if not p.exists():
+        return
+    d = json.loads(p.read_text())
+    arms = {tuple(float(x) for x in k.split("/")): v for k, v in d["arms"].items()}
+    pens = sorted({k[2] for k in arms} - {0.0} | {0.0})
+    rows = ["| ep | keep | " + " | ".join(f"`load_penalty={q:g}`" for q in pens) + " |",
+            "|---|---|" + "---|" * len(pens)]
+    for ep in d["eps"]:
+        k0 = max(k[1] for k in arms if k[0] == ep)
+        base = arms[(ep, k0, 0.0)][WORK]
+        for keep in KEEPS:
+            cells = [f"{100 * (arms[(ep, keep, q)][WORK] / base - 1):+.1f}%" for q in pens
+                     if (ep, keep, q) in arms]
+            if cells:
+                rows.append(f"| {int(ep)} | {int(keep)} | " + " | ".join(cells) + " |")
+    (RUNS / "loadpen.md").write_text(
+        "# Expert slots on the busiest rank, over the mean, against stock routing\n\n"
+        "Qwen3-30B-A3B in-engine, `EPS=4,8,16 PENS=0,1,2,4,8`. Negative is a flatter spread "
+        "than stock routing. Dispatch volume and busiest-rank receipts do not appear because "
+        "they are bit-identical across every penalty in the row.\n\n" + "\n".join(rows) + "\n")
+    print(f"wrote {RUNS / 'loadpen.md'}")
+
+
 def main() -> None:
     data = {t: read(t) for t in TAGS}
     have = [t for t in TAGS if data[t]]
@@ -125,6 +156,7 @@ def main() -> None:
         "work than stock routing.\n\n" + "\n".join(rows) + "\n")
     print("\n".join(rows))
     print(f"wrote {RUNS / 'epscale.png'} and {RUNS / 'epscale.md'}")
+    loadpen()
 
 
 if __name__ == "__main__":

@@ -388,6 +388,51 @@ Everything from `experiments/fanout.py` is an iid (optionally gamma-skewed) Gaus
 model. It tests the **mechanism, not the magnitude**: a trained router's logits correlate
 across tokens and layers in ways no synthetic draw reproduces.
 
+### The same measurement on a trained router, inside the engine
+
+`experiments/imbalance.py` closes that gap. It loads one engine under *stock* routing - the
+plugin patches nothing, `PLACEMENT_KEEP` stays unset - and only reads each router call's
+logits, scoring every `(ep, keep, load_penalty)` arm on them. So every arm sees the same 240
+router calls of a trained model, with no run-to-run variance between arms at all, and the
+expert-to-rank map being `e * G // E` means one engine load reports for any `ep`.
+
+![what the rule removes from the all-to-all](runs/epscale.png)
+
+Both savings grow with the world, because a fixed `keep` reaches a shrinking fraction of it.
+At `keep=4` of top-8, `load_penalty=1`, against that `ep`'s own stock routing:
+
+| | `ep=4` | `ep=8` | `ep=16` |
+| --- | --- | --- | --- |
+| dispatch pairs removed, Qwen3-30B-A3B | 23.5% | 36.7% | 44.3% |
+| the same, Qwen3.5-35B | 23.7% | 37.6% | 43.6% |
+| the same, Gemma-4-26B-A4B | 25.1% | 38.3% | 43.6% |
+| removed from the **busiest** rank, Qwen3-30B-A3B | 4.6% | 8.9% | 10.1% |
+| the same, Qwen3.5-35B | 6.8% | 10.1% | 12.4% |
+| the same, Gemma-4-26B-A4B | 4.1% | 7.0% | 8.7% |
+
+Three families agree to within a couple of points at every size. The busiest rank improving is
+not an extra objective - the rule only ever *deletes* a (token, rank) visit, never adds one, so
+no rank can receive more than it did under stock and the maximum falls with the sum. Over
+8-GPU hosts the same arithmetic is the node map, which makes the `ep=4` column the inter-node
+fan-out of a 32-GPU deployment.
+
+`load_penalty=1` is the EPLB-flavoured knob, and it is free here: both columns above come out
+bit-identical to the plain rule, because the tail is confined to the head's ranks either way
+and the penalty only reorders which of those ranks a given slot lands on. What it buys is the
+third quantity - expert slots on the busiest rank. The plain rule leaves that spread wider
+than stock, since a tail pick lands on a rank the head already uses; the penalty roughly
+halves the excess (Qwen3.5-35B at `ep=16, keep=4`: 45% over stock down to 29%), and at
+`keep=6` it crosses over, coming out **flatter** than stock routing - 7.6% flatter on Gemma at
+`ep=4`, 4.6% at `ep=8`, 7.0% and 2.2% on Qwen3-30B-A3B. That arm improves every column at
+once: fewer bytes, a shorter collective tail, and a more even expert load than the router it
+replaces.
+
+The knob needs no tuning. Sweeping it at `PENS=0,1,2,4,8` moves the column by 11 points
+between 0 and 1 and by under 2 points over the whole rest of the range - a tail pick either
+has a less-loaded rank available among the head's ranks or it does not, and a penalty of one
+slot is already enough to prefer it. `runs/loadpen.md` is that sweep; `runs/epscale.md` is the
+full `(ep, keep)` grid with all four quantities for each family.
+
 ## The measurements
 
 Three instruments, and which one of them can see this rule is most of the story.
