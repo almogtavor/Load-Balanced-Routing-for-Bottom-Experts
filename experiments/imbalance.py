@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""Per-rank load imbalance, measured on the real router's logits inside a running engine.
+"""Dispatch fan-out and load, measured on the real router's logits inside a running engine.
 
-`fanout.py` predicts that the placement rule trades dispatch volume for a hotter busiest
-rank, from Gaussian logits. This measures the same three quantities on the logits an actual
-model emits, which is the only way to know whether the prediction's sign and size carry over.
-
-Stock routing decides the forward: `PLACEMENT_KEEP` stays unset, so the plugin patches
-nothing and the engine serves exactly what it would without this file. The probe only *reads*
-each router call's logits and scores every arm on them, so one engine load produces the whole
-`(keep, load_penalty)` sweep on identical inputs - a paired comparison, with no run-to-run
+Stock routing decides the forward: `PLACEMENT_KEEP` stays unset, so the plugin patches nothing
+and the engine serves exactly what it would without this file. The probe only *reads* each
+router call's logits and scores every arm on them, so one engine load produces the whole
+`(ep, keep, load_penalty)` grid on identical inputs - a paired comparison with no run-to-run
 variance between arms at all.
 
-Three numbers per arm, all relative to the rank total:
+The expert-to-rank map is `e * G // E`, arithmetic on the expert id alone, so the grid can
+report for any `ep` on whatever GPU count the engine happens to fit on. At `G` ranks over
+8-GPU nodes the same arithmetic gives the node map, which makes the `G=2` and `G=4` rows the
+inter-node (RDMA) fan-out of a 16- and 32-GPU deployment.
 
-* `work` - expert slots assigned to the busiest rank, over the mean. On the critical path:
-  every rank waits for the slowest expert GEMM.
-* `disp` - tokens dispatched to the busiest rank, over the mean. The all-to-all's tail.
-* `vol` - summed tokens over all ranks, the quantity the rule is designed to cut.
+Four numbers per arm:
+
+* `vol`  - summed (token, rank) dispatch pairs. What the rule is built to cut.
+* `disp` - dispatch pairs landing on the busiest rank. The all-to-all's tail.
+* `work` - expert slots on the busiest rank, over the mean. Every rank waits for the slowest.
+* `exp`  - slots on the busiest *expert*, over the mean. Total slots are fixed, so this is
+  the grouped GEMM's own tail: identical work spread over a longer per-expert block is slower.
 
 Run through `run.sh` with `PLACEMENT_PROBE` pointing here; `plugin.register()` loads it inside
 every worker, which is the only place the patch can reach the model.
@@ -24,38 +26,62 @@ every worker, which is the only place the patch can reach the model.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import pathlib
 
 import torch
 
-RANKS = int(os.environ.get("RANKS", 4))      # the ep_size being reported for
-CALLS = int(os.environ.get("CALLS", 240))    # router calls to score, then dump and go quiet
+
+def _ints(name, default):
+    return [int(x) for x in os.environ.get(name, default).split(",")]
+
+
+def _floats(name, default):
+    return [float(x) for x in os.environ.get(name, default).split(",")]
+
+
+EPS = _ints("EPS", "4,8,16")              # ep sizes to report for, independent of GPU count
+KEEPS = _ints("IMB_KEEPS", "6,4,2")       # substitution budgets; stock is added per ep
+PENS = _floats("PENS", "0,1")             # load_penalty values per keep
+CALLS = int(os.environ.get("CALLS", 240))  # router calls to score, then dump and go quiet
 TAG = os.environ.get("TAG", "imb")
 WARMUP = int(os.environ.get("WARMUP", 480))  # router calls to discard before measuring
-ARMS = [(8, 0.0), (4, 0.0), (4, 0.5), (4, 1.0), (4, 2.0), (4, 4.0), (2, 0.0), (2, 1.0)]
 
-_acc: dict[str, torch.Tensor] = {}
+_acc: dict[tuple, torch.Tensor] = {}
 _calls = 0
 _seen = 0
 _declined: dict[str, int] = {}
 _dumped = False
 
 
-def _hist(ids, n_experts):
-    """`(work[G], dispatch[G])` for one selection, which must be free of padding rows."""
-    rank = (torch.arange(n_experts, device=ids.device) * RANKS // n_experts)[ids.long()]
-    work = torch.zeros(RANKS, device=ids.device, dtype=torch.float64).scatter_add_(
-        0, rank.ravel(), torch.ones(rank.numel(), device=ids.device, dtype=torch.float64))
-    hot = torch.zeros(ids.shape[0], RANKS, dtype=torch.bool, device=ids.device)
+def _hist(ids, n_experts, ranks):
+    """`(work[G], dispatch[G], per_expert[E])` for one padding-free selection."""
+    ones = torch.ones(ids.numel(), device=ids.device, dtype=torch.float64)
+    flat = ids.long().ravel()
+    rank = (torch.arange(n_experts, device=ids.device) * ranks // n_experts)[ids.long()]
+    work = torch.zeros(ranks, device=ids.device, dtype=torch.float64).scatter_add_(
+        0, rank.ravel(), ones)
+    per_expert = torch.zeros(n_experts, device=ids.device, dtype=torch.float64).scatter_add_(
+        0, flat, ones)
+    hot = torch.zeros(ids.shape[0], ranks, dtype=torch.bool, device=ids.device)
     hot.scatter_(1, rank, True)
-    return work, hot.sum(0).to(torch.float64)
+    return work, hot.sum(0).to(torch.float64), per_expert
 
 
 def _decline(why: str) -> None:
     """Why a call was skipped, counted. An empty result is then a diagnosis, not a mystery."""
     _declined[why] = _declined.get(why, 0) + 1
+
+
+def _grid(k):
+    """`(ep, keep, load_penalty)` arms. Stock (`keep == k`) once per ep as that ep's baseline."""
+    for g in EPS:
+        yield g, k, 0.0
+        for keep, pen in itertools.product(KEEPS, PENS):
+            if keep < k:
+                yield g, keep, pen
 
 
 def probe(logits, topk_ids, k) -> None:
@@ -76,8 +102,6 @@ def probe(logits, topk_ids, k) -> None:
     if _seen <= WARMUP:
         return
     e = logits.shape[-1]
-    if e % RANKS or e // RANKS < k:
-        return _decline(f"{e} experts over {RANKS} ranks leaves no substitutes")
     # vLLM pads unused slots with -1, which under an unsigned index dtype reads as 4294967295;
     # either way such a row would be indexed out of bounds below, so drop the row.
     ids = topk_ids.view(torch.int32) if topk_ids.dtype == torch.uint32 else topk_ids
@@ -85,12 +109,16 @@ def probe(logits, topk_ids, k) -> None:
     if not bool(live.any()):
         return _decline("every row padded")
     logits, ids = logits[live], ids[live]
+    fl = logits.float()
     _calls += 1
-    for keep, pen in ARMS:
-        sel = ids if keep >= k else rewrite_torch(logits.float(), ids, keep, RANKS, pen)
-        w, d = _hist(sel, e)
-        row = torch.stack([w.max() / w.mean(), d.max() / d.mean(), d.sum(), w.sum()])
-        key = f"{keep}p{pen:g}"
+    for g, keep, pen in _grid(k):
+        if e % g or e // g < k:
+            _decline(f"{e} experts over {g} ranks leaves no substitutes")
+            continue
+        sel = ids if keep >= k else rewrite_torch(fl, ids, keep, g, pen)
+        w, d, x = _hist(sel, e, g)
+        row = torch.stack([d.sum(), d.max(), w.max() / w.mean(), x.max() / x.mean(), w.sum()])
+        key = (g, keep, pen)
         _acc[key] = row if key not in _acc else _acc[key] + row
     if _calls == CALLS:
         dump()
@@ -110,19 +138,36 @@ def dump() -> None:
               f" - the hook did not reach the router", flush=True)
         return
     out = {k: (v / _calls).tolist() for k, v in _acc.items()}
-    base = out[f"{max(k for k, _ in ARMS)}p0"]
-    print(f"[imb] ranks={RANKS} calls={_calls} seen={_seen} declined={_declined}", flush=True)
-    for key, (work, disp, vol, wk) in out.items():
-        # Total expert slots is `rows * top_k` in every arm by construction. If it moved, the
-        # rule dropped or duplicated a slot and every ratio above is measuring that instead.
-        assert abs(wk / base[3] - 1) < 1e-9, f"{key} moved total work {wk} vs {base[3]}"
-        print(f"[imb] {key:<7} work max/mean {work:.4f} ({work / base[0] - 1:+.2%})"
-              f"   disp max/mean {disp:.4f} ({disp / base[1] - 1:+.2%})"
-              f"   vol {vol / base[2] - 1:+.2%}", flush=True)
+    print(f"[imb] calls={_calls} seen={_seen} declined={_declined}", flush=True)
+    print(f"[imb] {'arm':<14}{'vol':>10}{'busiest rank recv':>20}{'busiest rank work':>20}"
+          f"{'busiest expert':>17}", flush=True)
+    for g in EPS:
+        if (g, _k0(), 0.0) not in out:
+            continue
+        base = out[(g, _k0(), 0.0)]
+        for (gg, keep, pen), (vol, dmax, work, xmax, wk) in out.items():
+            if gg != g:
+                continue
+            # Total expert slots is `rows * top_k` in every arm by construction. If it moved,
+            # the rule dropped or duplicated a slot and every ratio here measures that instead.
+            assert abs(wk / base[4] - 1) < 1e-9, f"{(gg, keep, pen)} moved work {wk}"
+            name = "stock" if keep >= _k0() else f"keep={keep} pen={pen:g}"
+            print(f"[imb] ep={g:<3} {name:<16}"
+                  f"{vol / base[0] - 1:>+9.2%}{dmax / base[1] - 1:>+19.2%}"
+                  f"{work / base[2] - 1:>+19.2%}{xmax / base[3] - 1:>+16.2%}", flush=True)
     p = pathlib.Path("runs") / f"imbalance_{TAG}_{rank}.json"
     p.parent.mkdir(exist_ok=True)
-    p.write_text(json.dumps({"ranks": RANKS, "calls": _calls, "arms": out}, indent=1))
+    p.write_text(json.dumps({"calls": _calls, "eps": EPS,
+                             "arms": {f"{g}/{keep}/{pen:g}": v for (g, keep, pen), v
+                                      in out.items()}}, indent=1))
     print(f"[imb] wrote {p}", flush=True)
+
+
+_TOPK = [0]
+
+
+def _k0():
+    return _TOPK[0]
 
 
 def install() -> None:
@@ -141,12 +186,13 @@ def install() -> None:
         elif self.eplb_state is not None:
             _decline("EPLB breaks the expert-to-rank map")
         else:
+            _TOPK[0] = self.top_k
             probe(router_logits, out[1], self.top_k)
         return out
 
     FusedTopKRouter._compute_routing = _compute_routing
-    print(f"[imb] probe installed, ranks={RANKS} calls={CALLS} warmup={WARMUP} arms={ARMS}",
-          flush=True)
+    print(f"[imb] probe installed, eps={EPS} keeps={KEEPS} pens={PENS} calls={CALLS} "
+          f"warmup={WARMUP}", flush=True)
 
 
 def main() -> None:

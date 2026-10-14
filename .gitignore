@@ -1,3 +1,5 @@
 runs/*
 !runs/vllm.png
+!runs/speedup.png
+!runs/speedup.md
 __pycache__/

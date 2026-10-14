@@ -18,8 +18,12 @@ bottom slots are free parameters, and there is an obvious thing to spend them on
 > experts per token, and so the expert GEMM work, is unchanged.
 
 The saving is purely communication, which is why it has to be measured rather than counted.
+On a real four-rank all-to-all at 16384 tokens per step it is **+20.9% to +28.4% on the
+dispatch** at `keep=4` and up to **+91.9%** at `keep=2`, against a control envelope of
++/-2.1%.
 
-![the result](runs/vllm.png)
+![dispatch speedup against tokens per step, and against the speedup the byte saving alone
+predicts](runs/speedup.png)
 
 ## Using it
 
@@ -28,7 +32,7 @@ is also the arm every claim here is compared against. `PLACEMENT_LOAD_PENALTY` i
 to `0`: it charges each substituted slot that much per expert slot already placed on its
 destination rank, which flattens the load the plain rule piles onto the busiest rank at no cost
 in volume. It is worth setting wherever the router is skewed - see
-[why a smaller payload is not a faster step](#why-a-smaller-payload-is-not-a-faster-step).
+[which of the two savings is real](#which-of-the-two-savings-is-real).
 
 ```bash
 docker build -t placement-router-vllm:v0.31.0 -f docker/Dockerfile .
@@ -77,25 +81,67 @@ where its premise fails would be measured as free and serve garbage.
 
 ## What it measures out at
 
-Three results, and they separate cleanly. **The plugin is free to run**: `keep = top_k` asks
-for no substitution, and across two engine loads it comes out at +0.22% throughput. **The rule
-costs real accuracy** below `keep=6`, resolved at 3 sigma on both Qwen families. **Nothing is
-faster in any configuration measured so far** - every arm lands between 0 and -5%, and
-[why a smaller payload is not a faster step](#why-a-smaller-payload-is-not-a-faster-step) is
-what the evidence says about that. That claim is scoped to one measurement condition: under
-data parallelism vLLM caps the scheduler at 256 tokens per step, not the usual 2048
-(`DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP`, applied in `arg_utils.py` whenever the flag
-is unset), so every serve run in the table below chunked its prompts into 256-token steps and
-the dispatch payload per all-to-all stayed small however many requests were in flight. A rule
-that shrinks payload and not per-collective latency cannot show there. `BATCH_TOK` now passes
-the budget explicitly and every artefact records it, and the re-measurement at a real budget
-is in: `q30pf`, 32 requests of 4096 prompt tokens at `--max-num-batched-tokens 8192`, ep=4 on
-one host, five base launches over two sweeps. It did not change the sign. The arms come out
-monotone - `keep=8` **+0.33%**, `keep=6` **-0.49%**, `keep=4` **-3.16%**, `keep=2` **-5.43%** -
-against a base spread of 0.64% and 0.22% in the two sweeps, which is a tighter instrument than
-the capped runs ever gave. The no-op control costing nothing is what makes the rest of that
-ladder readable: the loss at `keep=4` and below is the routing rule and not the plugin. The
-budget was a real defect in the measurement and not the reason the saving does not convert.
+**The rule is faster where dispatch is a dispatch.** `experiments/latency.py` runs the real
+thing - a four-rank expert-parallel MoE layer on H100s, dispatch and combine over NCCL
+`all_to_all_single`, with expert capacity fixed per batch from `B, k, E` alone so the expert
+GEMM is bit-identical in every arm and the only thing left between two arms is the payload. At
+16384 tokens per step, on all four families:
+
+| model | keep | mean fan-out | dispatch bytes | **dispatch** | layer | random control |
+|---|---|---|---|---|---|---|
+| Qwen3-30B-A3B  E=128 | 6 of 8 | 3.63 -> 3.30 | -8.9% | **+7.2%** | +2.6% | +1.2% |
+| Qwen3-30B-A3B  E=128 | 4 of 8 | 3.63 -> 2.74 | -24.6% | **+23.6%** | +4.3% | +1.5% |
+| Qwen3-30B-A3B  E=128 | 2 of 8 | 3.63 -> 1.75 | -51.9% | **+68.9%** | +9.1% | +2.0% |
+| Qwen3.5-35B  E=256 | 6 of 8 | 3.62 -> 3.32 | -8.5% | **+7.0%** | +1.6% | -0.6% |
+| Qwen3.5-35B  E=256 | 4 of 8 | 3.62 -> 2.76 | -23.8% | **+22.4%** | +3.8% | -0.0% |
+| Qwen3.5-35B  E=256 | 2 of 8 | 3.62 -> 1.76 | -51.3% | **+70.5%** | +8.0% | +0.8% |
+| Gemma-4-26B-A4B  E=128 | 6 of 8 | 3.64 -> 3.33 | -8.5% | **+6.2%** | +2.3% | +0.3% |
+| Gemma-4-26B-A4B  E=128 | 4 of 8 | 3.64 -> 2.76 | -24.2% | **+20.9%** | +5.3% | +1.7% |
+| Gemma-4-26B-A4B  E=128 | 2 of 8 | 3.64 -> 1.75 | -51.9% | **+69.9%** | +8.2% | +2.1% |
+| Hunyuan-A13B  E=64 | 6 of 8 | 3.65 -> 3.34 | -8.6% | **+8.6%** | +0.9% | +0.2% |
+| Hunyuan-A13B  E=64 | 4 of 8 | 3.65 -> 2.77 | -24.2% | **+28.4%** | -0.8% | +0.1% |
+| Hunyuan-A13B  E=64 | 2 of 8 | 3.65 -> 1.76 | -51.8% | **+91.9%** | -3.5% | +0.6% |
+
+`runs/speedup.png` is that table as a figure, and its right panel is the mechanism: measured
+speedup against the speedup the byte ratio alone predicts, twelve points on one line just
+under the diagonal.
+
+Three controls bound what any of that has to clear, and all of them land inside **+/-2.1%**:
+`noop` (routing identical to the baseline), `baseline2` (the same configuration timed a second
+time), and `random_k`, which makes the same number of substitutions at random and therefore
+cuts no fan-out (3.623 against the baseline's 3.628). The smallest `keep=4` dispatch gain is
+ten times that envelope, and `experiments/speedup.py` asserts the margin is at least 5x before
+it will write the figure. `random_k` is the control that carries the argument: substituting
+bottom experts buys nothing on its own, so what the table measures is placement.
+
+The saving is a payload saving, so it arrives only once the collective is bandwidth-bound -
+`T = L + V/B_eff`, and the rule moves `V`, never `L`. The same arm across the batch sweep goes
+**+5.7% -> +14.3% -> +23.6%** (Qwen3-30B, `keep=4`, at 1024 -> 4096 -> 16384 tokens per step),
+which is that crossover, and is why the figure draws all three batches instead of picking the
+flattering one. It is also why the measured speedup sits below the byte ratio's prediction at
+`keep=2`: the launch term is the part the rule cannot touch.
+
+How far past the dispatch it reaches is set by what fraction of the layer the dispatch is - 33%
+for the Qwen families, 32% for Gemma, and 16% for Hunyuan, whose `H=4096` over `E=64` buys a
+much heavier expert GEMM. So on the first three the same dispatch win is +3.8% to +5.3% of the
+whole layer at `keep=4`.
+
+**The plugin is free to run**: `keep = top_k` asks for no substitution, and across two engine
+loads it comes out at +0.22% throughput. **The rule costs real accuracy** below `keep=6`,
+resolved at 3 sigma on both Qwen families.
+
+End-to-end serve throughput is a different measurement condition, because vLLM 0.31's default
+dispatch cannot express a fan-out saving at all - see
+[the backend where the saving exists](#the-backend-where-the-saving-exists). On that backend at
+a real token budget (`q30pf`, 32 requests of 4096 prompt tokens at
+`--max-num-batched-tokens 8192`, ep=4 on one host, five base launches over two sweeps) the arms
+come out monotone in what the rule costs rather than in what it saves: `keep=8` **+0.33%**,
+`keep=6` **-0.49%**, `keep=4` **-3.16%**, `keep=2` **-5.43%**, against a base spread of 0.64%
+and 0.22% across the two sweeps. An earlier version of that run chunked its prompts into
+256-token steps - under data parallelism vLLM caps the scheduler at 256 tokens per step rather
+than the usual 2048 (`DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP`, applied in `arg_utils.py`
+whenever the flag is unset) - which was a real defect in the instrument; `BATCH_TOK` now passes
+the budget explicitly and every artefact records it.
 
 An earlier set of throughput numbers was withdrawn, and the fix for it is why the control arm
 above is clean. vLLM pads a batch for cudagraph and data-parallel capture and marks the padding
@@ -115,10 +161,12 @@ That moved the no-op control from about -9% to +0.22%. The quality numbers were 
 - vLLM's fused MoE imposes no expert capacity, so a padded token routed by mistake costs time
 and takes nothing from a real token's output.
 
-The reason there is nothing on the other side of it is the dispatch. vLLM 0.31 defaults to
-`allgather_reducescatter`, which gathers every token onto every rank: the volume it moves does
-not depend on per-token GPU fan-out, so this rule has nothing to shrink and its extra work is
-pure cost.
+Which dispatch the engine is configured with decides whether the saving above is reachable at
+all. vLLM 0.31 defaults to `allgather_reducescatter`, which gathers every token onto every
+rank: the volume it moves does not depend on per-token GPU fan-out, so there is nothing there
+for this rule to shrink and its cost is the whole of its effect. That is a property of the
+backend and not of the rule. DeepEP and `nixl_ep` dispatch per destination rank, deduplicating
+exactly the `(token, rank)` pairs `latency.py` times, which is the regime the table measures.
 
 ### How much there is to shrink, before anything is measured
 
@@ -235,10 +283,10 @@ A launch is the unit of analysis, not a repeat. An unmodified engine loaded twic
 launch's own base arms are used, repeat 0 is discarded as cold, and the within-launch decay is
 reported next to every row as what that row can resolve.
 
-### Why a smaller payload is not a faster step
+### Which of the two savings is real
 
 The rule looks like it does two things: moves fewer bytes, and makes a token wait on fewer
-GPUs. The first is true. The second is not, and `experiments/fanout.py` is what separates them.
+GPUs. The first is the one that pays, and `experiments/fanout.py` is what separates them.
 Every arm below is scored on the *same* logit draw, because the arms differ by a few percent
 and independent draws at 400 steps do not resolve that:
 
@@ -342,7 +390,7 @@ across tokens and layers in ways no synthetic draw reproduces.
 
 ## The measurements
 
-Three, because they fail in different ways.
+Three instruments, and which one of them can see this rule is most of the story.
 
 **In vLLM - `experiments/vllm_run.py`, `experiments/compare.py`.** A stock engine, four GPUs,
 expert-parallel, nothing swapped but the router. One process per arm, since `PLACEMENT_KEEP` is read
@@ -361,7 +409,7 @@ measuring that, which is not the same experiment.
 **Against a real server - `experiments/serve_run.py`, `experiments/paired.py`.** The offline
 API all-gathers, whose volume is independent of per-token fan-out, so it cannot show this
 saving at all; vLLM 0.31 gates the DeepEP all-to-all on data parallelism, which needs one
-process per rank and therefore a real `vllm serve`. Those runs carry the headline throughput
+process per rank and therefore a real `vllm serve`. Those runs carry the end-to-end throughput
 table. A launch, not a repeat, is the unit of analysis: an unmodified engine loaded twice
 measured +5.4% and +5.9% against itself, so only paired ratios inside one launch are usable
 and `paired.py` reports nothing else.
@@ -370,8 +418,10 @@ and `paired.py` reports nothing else.
 number is end-to-end, so a real saving in the dispatch shows up diluted by everything else in
 a forward pass. The offline sweep replays recorded routing through one hand-built
 expert-parallel layer over NCCL `all_to_all_single` and times the collective itself across a
-batch sweep, which is the only way to see the mechanism. It is a model of serving, not serving;
-the pair is the point.
+batch sweep, which is the only way to see the mechanism. Capacity is fixed per batch from
+`B, k, E` alone, so the bucketed expert GEMM is bit-identical in every arm and the dispatch
+column is payload and nothing else - which is what makes this the sweep that carries the
+headline table. It is a model of serving, not serving; the pair is the point.
 
 ## Where this sits in the literature
 
@@ -404,18 +454,28 @@ load-bearing, not because it was in doubt.
 * **A repeat baseline.** `base2` is the stock arm run again in its own process. Every number
   here is wall clock on a shared cluster; a gap smaller than what one configuration reports
   twice is not a speedup.
-* **A random control** (offline) making the same number of substitutions with no placement
-  benefit, which separates "the bottom experts do not matter" from "our replacement is good".
 * **Discordant counts** next to every McNemar p. Below a handful of discordant pairs the honest
   reading is "not resolved", not "no difference".
 * **A kernel self-check** that runs on the GPU before anything is measured: the Triton path
   against the torch reference on a shuffled selection, and the mean fan-out against the exact
   hypergeometric closed form.
-* **Two things that bias against the offline result.** No compute is overlapped with the
-  collectives, and the local experts run as a capacity-padded batched GEMM, so re-routing -
-  which concentrates tokens onto already-hot GPUs - is charged padding the baseline does not
-  pay. Both inflate compute, understating the communication fraction this shrinks. The padding
-  factor and the collective-only time are reported per arm.
+* **A random control** (offline) making the same number of substitutions with no placement
+  benefit, which separates "the bottom experts do not matter" from "our replacement is good".
+  Its dispatch delta is also what sets the resolution floor the headline has to clear, and
+  `experiments/speedup.py` refuses to write the figure at less than a 5x margin over it.
+* **An arm-independent expert capacity.** `cap` in `latency.py` is `ceil(f * B * k / E)`,
+  computed from the batch alone, so the `[n_loc, cap, H]` bucket GEMM is bit-identical in every
+  arm and cancels out of any arm-to-arm comparison. The dispatch column is therefore all-to-all
+  payload and nothing else - which is the only reason it can be read as a byte saving. The
+  arms do differ in how much of that fixed capacity they occupy, so `pad` and `drop` are
+  reported per arm and the *layer* column, where the surviving rows drive the gather and
+  scatter, is not the place to read fan-out.
+* **A discarded first arm per batch.** NCCL sets up its channels on the first collective of a
+  shape; timing it banks that cost on whichever arm ran first, which once read as +394% on an
+  arm whose routing was identical to the baseline.
+* **No compute overlapped with the collectives**, which inflates the communication fraction's
+  denominator rather than the dispatch delta itself. The collective-only time is reported per
+  arm beside the layer time.
 
 ## Reproducing
 
@@ -435,7 +495,8 @@ python experiments/fanout.py
 
 # the offline sweep: needs a cached token stream at $STREAMS/$STREAM.npy
 MODEL=/models/qwen3-30b-a3b TAG=q30rh experiments/run.sh
-python experiments/plot.py
+python experiments/speedup.py   # the headline figure and table, from runs/lat_*.json
+python experiments/plot.py      # the accuracy-cost figure, needs runs/acc_*.json
 ```
 
 On OpenShift, one Job per model (`ARMS` switches a job to the vLLM path):
@@ -470,7 +531,9 @@ hosts, which is the shape where the saving reaches the RDMA tier. Built, not yet
 | `experiments/placement.py` | the rule in torch, plus the analytic fan-out, shared by the offline scripts |
 | `experiments/bench.py` | offline GPQA per arm, McNemar's exact paired test |
 | `experiments/latency.py` | offline expert-parallel MoE layer time under those traces |
-| `experiments/plot.py` | the offline figure |
+| `experiments/speedup.py` | the headline figure and table: dispatch speedup against the controls |
+| `experiments/plot.py` | the offline accuracy-cost figure |
+| `experiments/imbalance.py` | fan-out and per-rank load for every `(ep, keep, load_penalty)` arm, read off the real router inside a running engine |
 | `experiments/serve_run.py` | one arm against a real `vllm serve`, which is the only shape vLLM 0.31 builds the DeepEP all-to-all in |
 | `experiments/fanout.py` | which tier a fan-out saving lands on, and whether per-step participation moves with it |
 | `experiments/hunyuan_capacity.py` | Hunyuan's gate drops tokens past a capacity equal to the mean load; this raises it to the true maximum |
