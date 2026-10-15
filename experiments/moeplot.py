@@ -44,9 +44,10 @@ STEM = f"runs/{'moetime' if PHASE == 'moe' else PHASE + 'time'}"
 # ep scaling can be read without crossing clusters.
 LABEL = {"q30pf": "Qwen3-30B-A3B  E=128  ep=4", "q35pf": "Qwen3.5-35B  E=256  ep=4",
          "gmpf": "Gemma-4-26B-A4B  E=128  ep=4", "q30c4": "Qwen3-30B-A3B  E=128  ep=4  (host B)",
-         "q30e8": "Qwen3-30B-A3B  E=128  ep=8  (host B)"}
+         "q30e8": "Qwen3-30B-A3B  E=128  ep=8  (host B)",
+         "q30e16": "Qwen3-30B-A3B  E=128  ep=16  (host B, 2 nodes)"}
 COLOR = {"q30pf": "#1f77b4", "q35pf": "#d62728", "gmpf": "#9467bd", "q30c4": "#ff7f0e",
-         "q30e8": "#2ca02c"}
+         "q30e8": "#2ca02c", "q30e16": "#8c564b"}
 OUT = f"{STEM}.png"
 
 

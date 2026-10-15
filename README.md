@@ -205,13 +205,13 @@ the zero-substitution control: the kernel runs and selects nothing different.
 The numbers are the 16384-token prefill bucket, `x`n is how many independent launches each cell
 averages, and positive is faster. The floor is per row, because a cell is only ever divided by
 launches of its own tag: it is that row's widest base-against-base spread, halved. Four things
-make this the rule rather than the instrument. Every substitution arm is faster, on every
-family. The zero-substitution control is not (-0.2% to +0.1%), so the kernel's own cost is not
-what is being measured. The gain is monotone in the substitution budget. And the last two rows
-are the same model on the same host type at two world sizes, so the `ep` step can be read
-without crossing clusters: 0.9% becomes 4.0% at `keep=6`, 4.2% becomes 10.4% at `keep=4`. That
-is what a fan-out saving has to do, since a wider world gives a fixed `keep` more distinct ranks
-to avoid visiting.
+make this the rule rather than the instrument. The full substitution budget, `keep=4`, is faster
+on every row and every family, from +2.6% to +10.7%. The zero-substitution control is not (-0.2%
+to +0.1%), so the kernel's own cost is not what is being measured. The gain is monotone in the
+substitution budget, within every row. And the last two rows are the same model on the same host
+type at two world sizes, so the `ep` step can be read without crossing clusters: 0.9% becomes
+4.0% at `keep=6`, 4.2% becomes 10.4% at `keep=4`. That is what a fan-out saving has to do, since
+a wider world gives a fixed `keep` more distinct ranks to avoid visiting.
 
 Timing dispatch separately is not a convenience. The whole-layer clock nets the byte saving
 against the expert GEMM, and that GEMM is grouped: restricting the allowed expert set skews the
