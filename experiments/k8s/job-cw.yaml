@@ -87,8 +87,9 @@ spec:
         # intra-node runs never needed it because they never left the host. IBGDA is what lets
         # the GPU post sends without a CPU proxy, which is the path DeepEP's throughput
         # numbers assume.
-        - {name: NVSHMEM_IB_ENABLE_IBGDA, value: "1"}
-        - {name: NVSHMEM_IBGDA_NIC_HANDLER, value: "gpu"}
+        - {name: NVSHMEM_IB_ENABLE_IBGDA, value: "${IBGDA}"}
+        - {name: NVSHMEM_IBGDA_NIC_HANDLER, value: "${NIC_HANDLER}"}
+        - {name: NVSHMEM_DEBUG, value: "${NVSHMEM_DEBUG}"}
         - {name: NCCL_IB_DISABLE, value: "0"}
         # nixl_ep registers its EP buffers through UCX's *device* (GPU-initiated) API, and
         # with UCX's default transport set one of the memory domains it picks has no device-API

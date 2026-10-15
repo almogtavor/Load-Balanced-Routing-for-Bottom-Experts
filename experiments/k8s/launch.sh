@@ -70,8 +70,11 @@ NODE="${NODE:+kubernetes.io/hostname: ${NODE}}"
 export NAME TAG MODEL GPUS MEM TF4 TFVER BATCH NWIN KEEPS STREAM TOKREF NODE PENS ARMS SCRIPT IMG A2A SERVE DP REPS REP0
 export NODES BAD NS CLAIM
 export N_REQ PROMPT_LEN GEN_LEN REPEATS BATCH_TOK GPU_UTIL
+# Internode NVSHMEM knobs, parameterised because which RDMA transport a cluster
+# actually lets a pod open is a property of the cluster, not of the experiment.
+export IBGDA="${IBGDA:-1}" NIC_HANDLER="${NIC_HANDLER:-gpu}" NVSHMEM_DEBUG="${NVSHMEM_DEBUG:-WARN}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ${KCTL} delete job "placement-${NAME}" --ignore-not-found >/dev/null
-envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $PENS $ARMS $SCRIPT $IMG $A2A $SERVE $DP $REPS $REP0 $N_REQ $PROMPT_LEN $GEN_LEN $REPEATS $BATCH_TOK $GPU_UTIL $NODES $BAD $NS $CLAIM' \
+envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $PENS $ARMS $SCRIPT $IMG $A2A $SERVE $DP $REPS $REP0 $N_REQ $PROMPT_LEN $GEN_LEN $REPEATS $BATCH_TOK $GPU_UTIL $NODES $BAD $NS $CLAIM $IBGDA $NIC_HANDLER $NVSHMEM_DEBUG' \
   < "${here}/${TPL}" | ${KCTL} apply -f -
 echo "launched placement-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} tf4=${TF4} arms=${ARMS:-offline} a2a=${A2A:-default} serve=${SERVE} dp=${DP} reps=${REPS} rep0=${REP0} shape=${N_REQ}x${PROMPT_LEN}/${GEN_LEN} btok=${BATCH_TOK} nodes=${NODES} ep=$(( GPUS * NODES ))"
