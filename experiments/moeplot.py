@@ -63,10 +63,16 @@ def load() -> dict:
             for k, arms in runs.items()}
 
 
-def gains() -> tuple[dict, float, dict]:
-    """`{tag: {arm: [per-launch %]}}`, the launch-to-launch floor, and the stock ms per tag."""
+def gains() -> tuple[dict, dict, dict]:
+    """`{tag: {arm: [per-launch %]}}`, the floor per tag, and the stock ms per tag.
+
+    The floor is per tag, not global: a cell in one row is only ever divided by launches of
+    its own tag, so another model's noisiest launch has no bearing on this row's resolution.
+    One global `max(spread)/2` let a single wide launch inflate every row at once.
+    """
     per = collections.defaultdict(lambda: collections.defaultdict(list))
-    stock, spreads = {}, []
+    stock = {}
+    spreads = collections.defaultdict(list)
     for (tag, _rep), arms in load().items():
         base = {a: bk for a, bk in arms.items() if a.startswith("base")}
         if not base or tag not in LABEL:
@@ -89,16 +95,19 @@ def gains() -> tuple[dict, float, dict]:
         if shared:
             b = max(shared)
             lo, hi = min(v[b] for v in bl), max(v[b] for v in bl)
-            spreads.append((hi - lo) / lo * 100)
+            spreads[tag].append((hi - lo) / lo * 100)
     if not per:
         raise SystemExit("no paired moetime launches yet")
-    if not spreads:
-        raise SystemExit("no launch loaded the stock engine twice, so the floor is unmeasured")
-    return per, max(spreads) / 2, stock
+    missing = [t for t in per if t not in spreads]
+    if missing:
+        raise SystemExit(f"no launch loaded the stock engine twice for {missing}, "
+                         "so those floors are unmeasured")
+    return per, {t: max(v) / 2 for t, v in spreads.items()}, stock
 
 
 def main() -> None:
-    per, band, stock = gains()
+    per, floor, stock = gains()
+    band = max(floor[t] for t in per)   # one shaded band, so it is the widest row's
     arms = sorted({a for t in per.values() for a in t}, key=arm_key)
     tags = [t for t in LABEL if t in per]
     fig, ax = plt.subplots(figsize=(7.6, 4.3))
@@ -108,7 +117,7 @@ def main() -> None:
         ys = [st.mean(per[t][a]) if per[t][a] else 0.0 for a in arms]
         er = [st.stdev(per[t][a]) if len(per[t][a]) > 1 else 0.0 for a in arms]
         ax.bar(xs, ys, w * 0.92, yerr=er, capsize=3, color=COLOR[t],
-               label=f"{LABEL[t]}  ({stock[t][0]:.2f} ms stock)")
+               label=f"{LABEL[t]}  ({stock[t][0]:.2f} ms stock, floor +/-{floor[t]:.2f}%)")
     ax.axhspan(-band, band, color="0.82", zorder=0)
     ax.axhline(0, color="black", lw=0.7)
     ax.set_xticks(range(len(arms)), [arm_label(a) for a in arms])
@@ -121,16 +130,16 @@ def main() -> None:
     fig.tight_layout()
     fig.savefig(OUT, dpi=200)
 
-    rows = [f"| model | stock ms / {NAME.lower()} | tokens / forward | "
+    rows = [f"| model | stock ms / {NAME.lower()} | tokens / forward | floor | "
             + " | ".join(arm_label(a).replace("\n", " ") for a in arms) + " |",
-            "|---" * (len(arms) + 3) + "|"]
+            "|---" * (len(arms) + 4) + "|"]
     for t in tags:
         # The launch count rides in the cell, not in one column: arms entered the grid at
         # different times, so a single per-row count would claim replication an arm measured
         # once does not have.
         cells = [f"**{st.mean(v):+.1f}%** x{len(v)}" if (v := per[t][a]) else "-" for a in arms]
         rows.append(f"| {LABEL[t]} | {stock[t][0]:.2f} | {stock[t][1]} | "
-                    + " | ".join(cells) + " |")
+                    f"+/-{floor[t]:.2f}% | " + " | ".join(cells) + " |")
     md = "\n".join(rows)
     where = {"moe": "around `MoERunner._forward_impl` - routing, dispatch, expert GEMM, combine",
              "disp": "around `DeepEPHTPrepareAndFinalize.prepare_async` and the wait on its "
@@ -141,10 +150,11 @@ def main() -> None:
         f"{NAME} time inside a running vLLM 0.31 engine on the DeepEP high-throughput "
         f"all-to-all, timed with CUDA events {where}, and reduced to a median per token-count "
         "bucket. Each arm is divided by the base arms of its own launch; `keep=8` "
-        "is the zero-substitution control. Positive is faster. Launch-to-launch floor "
-        f"+/-{band:.2f}%.\n\n{md}\n")
+        "is the zero-substitution control. Positive is faster. The floor is that model's own "
+        "widest base-against-base spread, halved, over the launches in its row.\n\n"
+        f"{md}\n")
     print(md)
-    print(f"\ncontrol floor +/-{band:.2f}%\nWROTE {OUT} and {STEM}.md")
+    print(f"\nWROTE {OUT} and {STEM}.md")
 
 
 if __name__ == "__main__":

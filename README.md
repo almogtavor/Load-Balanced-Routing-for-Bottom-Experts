@@ -192,16 +192,23 @@ the zero-substitution control: the kernel runs and selects nothing different.
 
 ![In-engine DeepEP dispatch time](runs/disptime.png)
 
-| model | stock ms / deepep dispatch | tokens / forward | keep=8 (control: no substitution) | keep=6 | keep=6 +load balance | keep=4 | keep=4 +load balance |
-|---|---|---|---|---|---|---|---|
-| Qwen3-30B-A3B  E=128  ep=4 | 1.96 | 16384 | **+0.1%** x2 | **+0.9%** x2 | **+0.7%** x1 | **+4.0%** x1 | - |
-| Qwen3-30B-A3B  E=128  ep=8 | 2.23 | 16384 | **+0.0%** x3 | **+3.9%** x3 | **+4.0%** x4 | **+10.5%** x1 | **+10.4%** x1 |
+<!-- disptime -->
+| model | stock ms / deepep dispatch | tokens / forward | floor | keep=8 (control: no substitution) | keep=6 | keep=6 +load balance | keep=4 | keep=4 +load balance |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3-30B-A3B  E=128  ep=4 | 1.96 | 16384 | +/-0.41% | **+0.0%** x3 | **+0.9%** x2 | **+0.8%** x2 | **+4.0%** x1 | - |
+| Qwen3.5-35B  E=256  ep=4 | 1.94 | 16384 | +/-0.16% | **-0.0%** x1 | - | **+0.0%** x1 | - | **+2.7%** x1 |
+| Gemma-4-26B-A4B  E=128  ep=4 | 2.13 | 16384 | +/-0.02% | **-0.2%** x1 | **+0.7%** x1 | - | **+3.9%** x1 | - |
+| Qwen3-30B-A3B  E=128  ep=8 | 2.23 | 16384 | +/-0.05% | **+0.0%** x3 | **+3.9%** x3 | **+4.0%** x5 | **+10.7%** x2 | **+10.4%** x2 |
+<!-- /disptime -->
 
 The numbers are the 16384-token prefill bucket, `x`n is how many independent launches each cell
-averages, and positive is faster. Three things make it the rule rather than the instrument: the
-zero-substitution control sits on the floor (+0.0% to +0.1% against +/-0.06%), the gain is
-monotone in the substitution budget, and it roughly doubles going from ep=4 to ep=8 - which is
-what a fan-out saving has to do, since there are more distinct ranks to avoid visiting.
+averages, and positive is faster. The floor is per row, because a cell is only ever divided by
+launches of its own tag: it is that row's widest base-against-base spread, halved. Four things
+make this the rule rather than the instrument. Every substitution arm is faster, on all four
+families. The zero-substitution control is not (-0.2% to +0.0%), so the kernel's own cost is
+not what is being measured. The gain is monotone in the substitution budget. And it roughly
+doubles from ep=4 to ep=8 - which is what a fan-out saving has to do, since a wider world gives
+a fixed `keep` more distinct ranks to avoid visiting.
 
 Timing dispatch separately is not a convenience. The whole-layer clock nets the byte saving
 against the expert GEMM, and that GEMM is grouped: restricting the allowed expert set skews the
@@ -210,17 +217,23 @@ expert's token count, unlike `latency.py`'s fixed capacity, so the skew is free 
 also what the load-balance term is for - adding the max-rank-load penalty to the same objective
 (`PLACEMENT_LOAD_PENALTY=1`) keeps the dispatch saving and pays the skew back:
 
-| model | stock ms / moe layer | tokens / forward | keep=8 (control: no substitution) | keep=6 | keep=6 +load balance | keep=4 | keep=4 +load balance |
-|---|---|---|---|---|---|---|---|
-| Qwen3-30B-A3B  E=128  ep=4 | 8.08 | 16384 | **-0.7%** x5 | **-2.0%** x4 | **+1.9%** x2 | **-5.2%** x3 | **-1.6%** x1 |
-| Qwen3.5-35B  E=256  ep=4 | 7.06 | 16384 | **-0.2%** x2 | **-1.7%** x2 | - | **-1.8%** x2 | - |
-| Qwen3-30B-A3B  E=128  ep=8 | 11.17 | 16384 | **-0.1%** x4 | **-3.1%** x3 | **+0.6%** x5 | **-6.2%** x1 | **-1.6%** x2 |
+<!-- moetime -->
+| model | stock ms / moe layer | tokens / forward | floor | keep=8 (control: no substitution) | keep=6 | keep=6 +load balance | keep=4 | keep=4 +load balance |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3-30B-A3B  E=128  ep=4 | 8.08 | 16384 | +/-0.21% | **-0.7%** x5 | **-2.1%** x4 | **+1.9%** x3 | **-5.2%** x3 | **-1.8%** x1 |
+| Qwen3.5-35B  E=256  ep=4 | 7.06 | 16384 | +/-0.22% | **-0.3%** x3 | **-1.7%** x2 | **+0.9%** x1 | **-1.8%** x2 | **-0.5%** x1 |
+| Gemma-4-26B-A4B  E=128  ep=4 | 9.67 | 16384 | +/-0.10% | **-0.2%** x2 | **-1.9%** x2 | - | **-5.2%** x2 | - |
+| Qwen3-30B-A3B  E=128  ep=8 | 11.17 | 16384 | +/-0.52% | **-0.1%** x4 | **-3.1%** x3 | **+0.5%** x6 | **-6.0%** x2 | **-1.7%** x3 |
+<!-- /moetime -->
 
-So the whole-layer win belongs to `keep=6` with the load-balance term, at +1.9% (ep=4) and
-+0.6% (ep=8) against a +/-0.52% floor, while the dispatch saving itself is visible at every
-budget and is 10x to 170x its own floor. The split is the point: `runs/disptime.png` measures
-the term the rule acts on, and `runs/moetime.png` measures what reaches the layer once the
-GEMM has had its say.
+`keep=6` with the load-balance term is the only arm that clears the floor on the whole-layer
+clock, and it clears it on every family it has been measured on - +1.9%, +0.9%, +0.5% - while
+the dispatch saving underneath is 10x to 200x its own floor at every budget. That is the split,
+and it is why both figures are here: `runs/disptime.png` measures the term the rule acts on,
+and `runs/moetime.png` measures what reaches the layer after the grouped GEMM has had its say.
+`keep=6 load_penalty=1` is therefore the arm to deploy, and it is the one the offline
+[`ep` sweep](#the-same-measurement-on-a-trained-router-inside-the-engine) already singled out
+on load grounds alone.
 
 ### How much there is to shrink, before anything is measured
 
@@ -518,8 +531,9 @@ end-to-end rate above divides a saving in one collective by a whole serving step
 rides along on the same launches and puts CUDA events directly around the MoE forward and
 around DeepEP's dispatch, so the two can be read apart: dispatch is the term the rule acts on,
 and the whole layer is what survives the grouped expert GEMM. Same pairing as `paired.py` -
-each arm against the base arms of its own launch - and the floor comes from base-against-base
-within a launch, which on the dispatch clock is +/-0.06%.
+each arm against the base arms of its own launch - and each row's floor comes from
+base-against-base within the launches of that row, which on the dispatch clock is a few
+hundredths of a percent to +/-0.4%.
 
 **Offline, isolating the all-to-all - `experiments/{accuracy,bench,latency}.py`.** The vLLM
 number is end-to-end, so a real saving in the dispatch shows up diluted by everything else in
