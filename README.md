@@ -41,7 +41,7 @@ What reaches the whole layer is set by the *other* half of the collective. Combi
 | Qwen3-30B-A3B  E=128  ep=8  (host B) | 11.17 | 16384 | +/-0.52% | **-0.1%** x8 | **-2.7%** x7 | **+0.4%** x10 | **-6.4%** x6 | **-1.8%** x7 |
 <!-- /moetime -->
 
-`keep=6 load_penalty=1` is the arm to deploy: positive on all five rows (+2.0%, +0.5%, +3.2%, +1.9%, +0.4%), clear of the floor on the four whose floor is under 0.25%, with the ep=8 row inside its own wider 0.52% floor - and `keep=6` is the deepest substitution this repo cannot distinguish from stock on paired NLL (`experiments/accuracy.py`).
+`keep=6 load_penalty=1` is the arm to deploy: positive on all five rows (+2.0%, +0.5%, +3.2%, +1.9%, +0.4%), clear of the floor on the four whose floor is under 0.25%, with the ep=8 row inside its own wider 0.52% floor - and `keep=6` costs +0.002 nats on paired NLL, 5-14x less than refilling the same slots at random (`experiments/accuracy.py`).
 
 ## Reproducing
 

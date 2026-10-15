@@ -14,7 +14,7 @@ paying for.
 the all-to-all and the expert GEMM behind it both end when the *slowest rank* ends, and total
 expert work is `sum_t k` whatever `keep` is - so only its spread over ranks can move. Taking the
 highest logit on a hot rank piles the tail onto whichever rank the head already loaded most,
-and `experiments/fanout.py` measures the busiest rank's work rising 10-20% while the summed
+and `experiments/imbalance.py` measures the busiest rank's work rising 10-20% while the summed
 volume falls 24-52%. `load_penalty` charges each tail pick that much per slot already placed on its
 rank, which removes the imbalance at the same volume. It is a different selection, so unlike
 `keep` alone it has to be re-measured for quality, not just for rate.
