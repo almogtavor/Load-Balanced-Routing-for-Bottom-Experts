@@ -40,9 +40,13 @@ KEY = "buckets" if PHASE == "moe" else PHASE
 NAME = {"moe": "MoE layer", "disp": "DeepEP dispatch", "comb": "DeepEP combine"}[PHASE]
 STEM = f"runs/{'moetime' if PHASE == 'moe' else PHASE + 'time'}"
 
+# `q30c4` and `q30e8` are the same model on the same host type at two world sizes, so the
+# ep scaling can be read without crossing clusters.
 LABEL = {"q30pf": "Qwen3-30B-A3B  E=128  ep=4", "q35pf": "Qwen3.5-35B  E=256  ep=4",
-         "gmpf": "Gemma-4-26B-A4B  E=128  ep=4", "q30e8": "Qwen3-30B-A3B  E=128  ep=8"}
-COLOR = {"q30pf": "#1f77b4", "q35pf": "#d62728", "gmpf": "#9467bd", "q30e8": "#2ca02c"}
+         "gmpf": "Gemma-4-26B-A4B  E=128  ep=4", "q30c4": "Qwen3-30B-A3B  E=128  ep=4  (host B)",
+         "q30e8": "Qwen3-30B-A3B  E=128  ep=8  (host B)"}
+COLOR = {"q30pf": "#1f77b4", "q35pf": "#d62728", "gmpf": "#9467bd", "q30c4": "#ff7f0e",
+         "q30e8": "#2ca02c"}
 OUT = f"{STEM}.png"
 
 
@@ -98,11 +102,15 @@ def gains() -> tuple[dict, dict, dict]:
             spreads[tag].append((hi - lo) / lo * 100)
     if not per:
         raise SystemExit("no paired moetime launches yet")
-    missing = [t for t in per if t not in spreads]
-    if missing:
-        raise SystemExit(f"no launch loaded the stock engine twice for {missing}, "
-                         "so those floors are unmeasured")
-    return per, {t: max(v) / 2 for t, v in spreads.items()}, stock
+    # A row with no base-against-base launch has no measured resolution, so it is not
+    # publishable yet - drop it rather than print a cell nothing bounds. A sweep in flight
+    # hits this for a few minutes, because `base2` is the last arm to load.
+    for t in [t for t in per if t not in spreads]:
+        print(f"SKIP {t}: no launch loaded the stock engine twice, floor unmeasured")
+        del per[t]
+    if not per:
+        raise SystemExit("no paired moetime launches with a measured floor yet")
+    return per, {t: max(v) / 2 for t, v in spreads.items() if t in per}, stock
 
 
 def main() -> None:

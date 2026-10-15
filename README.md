@@ -195,10 +195,10 @@ the zero-substitution control: the kernel runs and selects nothing different.
 <!-- disptime -->
 | model | stock ms / deepep dispatch | tokens / forward | floor | keep=8 (control: no substitution) | keep=6 | keep=6 +load balance | keep=4 | keep=4 +load balance |
 |---|---|---|---|---|---|---|---|---|
-| Qwen3-30B-A3B  E=128  ep=4 | 1.96 | 16384 | +/-0.41% | **+0.0%** x3 | **+0.9%** x2 | **+0.8%** x2 | **+4.0%** x1 | - |
+| Qwen3-30B-A3B  E=128  ep=4 | 1.96 | 16384 | +/-0.36% | **+0.0%** x4 | **+0.8%** x4 | **+0.8%** x4 | **+4.0%** x1 | - |
 | Qwen3.5-35B  E=256  ep=4 | 1.94 | 16384 | +/-0.16% | **-0.0%** x1 | - | **+0.0%** x1 | - | **+2.7%** x1 |
 | Gemma-4-26B-A4B  E=128  ep=4 | 2.13 | 16384 | +/-0.02% | **-0.2%** x1 | **+0.7%** x1 | - | **+3.9%** x1 | - |
-| Qwen3-30B-A3B  E=128  ep=8 | 2.23 | 16384 | +/-0.05% | **+0.0%** x3 | **+3.9%** x3 | **+4.0%** x5 | **+10.7%** x2 | **+10.4%** x2 |
+| Qwen3-30B-A3B  E=128  ep=8  (host B) | 2.23 | 16384 | +/-0.05% | **+0.0%** x3 | **+3.9%** x3 | **+4.0%** x5 | **+10.7%** x2 | **+10.4%** x2 |
 <!-- /disptime -->
 
 The numbers are the 16384-token prefill bucket, `x`n is how many independent launches each cell
@@ -220,14 +220,14 @@ also what the load-balance term is for - adding the max-rank-load penalty to the
 <!-- moetime -->
 | model | stock ms / moe layer | tokens / forward | floor | keep=8 (control: no substitution) | keep=6 | keep=6 +load balance | keep=4 | keep=4 +load balance |
 |---|---|---|---|---|---|---|---|---|
-| Qwen3-30B-A3B  E=128  ep=4 | 8.08 | 16384 | +/-0.21% | **-0.7%** x5 | **-2.1%** x4 | **+1.9%** x3 | **-5.2%** x3 | **-1.8%** x1 |
+| Qwen3-30B-A3B  E=128  ep=4 | 8.08 | 16384 | +/-0.20% | **-0.6%** x6 | **-2.1%** x6 | **+2.0%** x4 | **-5.2%** x3 | **-1.8%** x1 |
 | Qwen3.5-35B  E=256  ep=4 | 7.06 | 16384 | +/-0.22% | **-0.3%** x3 | **-1.7%** x2 | **+0.9%** x1 | **-1.8%** x2 | **-0.5%** x1 |
 | Gemma-4-26B-A4B  E=128  ep=4 | 9.67 | 16384 | +/-0.10% | **-0.2%** x2 | **-1.9%** x2 | - | **-5.2%** x2 | - |
-| Qwen3-30B-A3B  E=128  ep=8 | 11.17 | 16384 | +/-0.52% | **-0.1%** x4 | **-3.1%** x3 | **+0.5%** x6 | **-6.0%** x2 | **-1.7%** x3 |
+| Qwen3-30B-A3B  E=128  ep=8  (host B) | 11.17 | 16384 | +/-0.52% | **-0.1%** x4 | **-3.1%** x3 | **+0.5%** x6 | **-6.0%** x2 | **-1.7%** x3 |
 <!-- /moetime -->
 
 `keep=6` with the load-balance term is the only arm that clears the floor on the whole-layer
-clock, and it clears it on every family it has been measured on - +1.9%, +0.9%, +0.5% - while
+clock, and it clears it on every family it has been measured on - +2.0%, +0.9%, +0.5% - while
 the dispatch saving underneath is 10x to 200x its own floor at every budget. That is the split,
 and it is why both figures are here: `runs/disptime.png` measures the term the rule acts on,
 and `runs/moetime.png` measures what reaches the layer after the grouped GEMM has had its say.
