@@ -200,6 +200,10 @@ def main() -> None:
           f"PLACEMENT_LOAD_PENALTY={os.environ.get('PLACEMENT_LOAD_PENALTY', '<unset>')} gpus={N_GPUS} "
           f"dp={DP * NODES} (local {DP}) tp={N_GPUS // DP} nodes={NODES} rank={RANK} "
           f"a2a={A2A}", flush=True)
+    # Rides along on every arm of every launch: two CUDA events per MoE forward, the same on
+    # the base arms, and the only engine-level clock on the layer this rule actually moves.
+    os.environ.setdefault("PLACEMENT_PROBE",
+                          str(pathlib.Path(__file__).with_name("moetime.py")))
     if RANK:
         peer()
 

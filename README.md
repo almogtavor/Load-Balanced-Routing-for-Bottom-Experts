@@ -178,6 +178,50 @@ for this rule to shrink and its cost is the whole of its effect. That is a prope
 backend and not of the rule. DeepEP and `nixl_ep` dispatch per destination rank, deduplicating
 exactly the `(token, rank)` pairs `latency.py` times, which is the regime the table measures.
 
+### Timed inside a running engine
+
+`latency.py` above is a standalone MoE layer, so every term in it is under the measurement's
+control. The engine is not: the same rule has to pay for itself inside `vllm serve` with a
+trained router, real token shapes, and no expert capacity. `experiments/moetime.py` rides along
+on every serve launch, records a CUDA event pair around `MoERunner._forward_impl` and a second
+pair around DeepEP's dispatch and the wait on its completion event, and reduces each to a
+median per power-of-two token-count bucket. Every arm is divided by the base arms of *its own
+launch*, because an unmodified engine loaded twice measures a few tenths of a percent against
+itself; the grey band in the figures is that floor, measured rather than assumed. `keep=8` is
+the zero-substitution control: the kernel runs and selects nothing different.
+
+![In-engine DeepEP dispatch time](runs/disptime.png)
+
+| model | stock ms / deepep dispatch | tokens / forward | keep=8 (control: no substitution) | keep=6 | keep=6 +load balance | keep=4 | keep=4 +load balance |
+|---|---|---|---|---|---|---|---|
+| Qwen3-30B-A3B  E=128  ep=4 | 1.96 | 16384 | **+0.1%** x2 | **+0.9%** x2 | **+0.7%** x1 | **+4.0%** x1 | - |
+| Qwen3-30B-A3B  E=128  ep=8 | 2.23 | 16384 | **+0.0%** x3 | **+3.9%** x3 | **+4.0%** x4 | **+10.5%** x1 | **+10.4%** x1 |
+
+The numbers are the 16384-token prefill bucket, `x`n is how many independent launches each cell
+averages, and positive is faster. Three things make it the rule rather than the instrument: the
+zero-substitution control sits on the floor (+0.0% to +0.1% against +/-0.06%), the gain is
+monotone in the substitution budget, and it roughly doubles going from ep=4 to ep=8 - which is
+what a fan-out saving has to do, since there are more distinct ranks to avoid visiting.
+
+Timing dispatch separately is not a convenience. The whole-layer clock nets the byte saving
+against the expert GEMM, and that GEMM is grouped: restricting the allowed expert set skews the
+group sizes, and a grouped GEMM is bound by its largest group. In the engine nothing caps an
+expert's token count, unlike `latency.py`'s fixed capacity, so the skew is free to grow. That is
+also what the load-balance term is for - adding the max-rank-load penalty to the same objective
+(`PLACEMENT_LOAD_PENALTY=1`) keeps the dispatch saving and pays the skew back:
+
+| model | stock ms / moe layer | tokens / forward | keep=8 (control: no substitution) | keep=6 | keep=6 +load balance | keep=4 | keep=4 +load balance |
+|---|---|---|---|---|---|---|---|
+| Qwen3-30B-A3B  E=128  ep=4 | 8.08 | 16384 | **-0.7%** x5 | **-2.0%** x4 | **+1.9%** x2 | **-5.2%** x3 | **-1.6%** x1 |
+| Qwen3.5-35B  E=256  ep=4 | 7.06 | 16384 | **-0.2%** x2 | **-1.7%** x2 | - | **-1.8%** x2 | - |
+| Qwen3-30B-A3B  E=128  ep=8 | 11.17 | 16384 | **-0.1%** x4 | **-3.1%** x3 | **+0.6%** x5 | **-6.2%** x1 | **-1.6%** x2 |
+
+So the whole-layer win belongs to `keep=6` with the load-balance term, at +1.9% (ep=4) and
++0.6% (ep=8) against a +/-0.52% floor, while the dispatch saving itself is visible at every
+budget and is 10x to 170x its own floor. The split is the point: `runs/disptime.png` measures
+the term the rule acts on, and `runs/moetime.png` measures what reaches the layer once the
+GEMM has had its say.
+
 ### How much there is to shrink, before anything is measured
 
 Dispatch volume is per-token GPU fan-out, and for uniform logits that is analytic: a rank
@@ -445,7 +489,7 @@ full `(ep, keep)` grid with all four quantities for each family.
 
 ## The measurements
 
-Three instruments, and which one of them can see this rule is most of the story.
+Four instruments, and which one of them can see this rule is most of the story.
 
 **In vLLM - `experiments/vllm_run.py`, `experiments/compare.py`.** A stock engine, four GPUs,
 expert-parallel, nothing swapped but the router. One process per arm, since `PLACEMENT_KEEP` is read
@@ -468,6 +512,14 @@ process per rank and therefore a real `vllm serve`. Those runs carry the end-to-
 table. A launch, not a repeat, is the unit of analysis: an unmodified engine loaded twice
 measured +5.4% and +5.9% against itself, so only paired ratios inside one launch are usable
 and `paired.py` reports nothing else.
+
+**Inside the engine, on the clock - `experiments/moetime.py`, `experiments/moeplot.py`.** The
+end-to-end rate above divides a saving in one collective by a whole serving step. The probe
+rides along on the same launches and puts CUDA events directly around the MoE forward and
+around DeepEP's dispatch, so the two can be read apart: dispatch is the term the rule acts on,
+and the whole layer is what survives the grouped expert GEMM. Same pairing as `paired.py` -
+each arm against the base arms of its own launch - and the floor comes from base-against-base
+within a launch, which on the dispatch clock is +/-0.06%.
 
 **Offline, isolating the all-to-all - `experiments/{accuracy,bench,latency}.py`.** The vLLM
 number is end-to-end, so a real saving in the dispatch shows up diluted by everything else in
@@ -545,6 +597,10 @@ MODEL=/models/qwen3-30b-a3b TAG=q30dp SERVE=1 DP=2 A2A=deepep_high_throughput \
   ARMS=base,base2,6,4,4p1,2,base3 experiments/run.sh
 python experiments/paired.py
 
+# the in-engine timers ride along on the launch above; render both clocks from its artefacts
+PHASE=disp PYTHONPATH=experiments python experiments/moeplot.py   # runs/disptime.{png,md}
+PYTHONPATH=experiments python experiments/moeplot.py              # runs/moetime.{png,md}
+
 # no GPU: which tier the saving lands on, and whether anything on the critical path moves
 python experiments/fanout.py
 
@@ -589,6 +645,8 @@ hosts, which is the shape where the saving reaches the RDMA tier. Built, not yet
 | `experiments/speedup.py` | the headline figure and table: dispatch speedup against the controls |
 | `experiments/plot.py` | the offline accuracy-cost figure |
 | `experiments/imbalance.py` | fan-out and per-rank load for every `(ep, keep, load_penalty)` arm, read off the real router inside a running engine |
+| `experiments/moetime.py` | CUDA-event timers around the MoE forward and around DeepEP's dispatch, riding along on every serve launch |
+| `experiments/moeplot.py` | those timings, paired within launch, against a measured floor - `PHASE=disp` for the dispatch figure |
 | `experiments/serve_run.py` | one arm against a real `vllm serve`, which is the only shape vLLM 0.31 builds the DeepEP all-to-all in |
 | `experiments/fanout.py` | which tier a fan-out saving lands on, and whether per-step participation moves with it |
 | `experiments/hunyuan_capacity.py` | Hunyuan's gate drops tokens past a capacity equal to the mean load; this raises it to the true maximum |

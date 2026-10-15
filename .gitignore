@@ -4,4 +4,10 @@ runs/*
 !runs/epscale.png
 !runs/epscale.md
 !runs/loadpen.md
+!runs/moetime.png
+!runs/moetime.md
+!runs/disptime.png
+!runs/disptime.md
+!runs/serve.png
+!runs/serve.md
 __pycache__/

@@ -135,6 +135,10 @@ spec:
         # many requests were in flight. It is a measurement condition, so it is passed.
         - {name: BATCH_TOK, value: "${BATCH_TOK}"}
         - {name: REPEATS, value: "${REPEATS}"}
+        # vLLM profiles memory per DP rank, and rank 0 carries the extra buffers;
+        # it then sizes every rank's KV cache from its own reading, so a 0.9 that
+        # fits rank 0 can overcommit rank 1 by a few hundred MiB and OOM it.
+        - {name: GPU_UTIL, value: "${GPU_UTIL}"}
         # bench.py pulls GPQA's rows from the Hub; the mirror is ungated but an anonymous
         # pull is rate-limited and four jobs start at once.
         - name: HF_TOKEN

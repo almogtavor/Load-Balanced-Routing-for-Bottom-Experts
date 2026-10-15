@@ -27,6 +27,14 @@ def arm_key(a):
     return -int(k), float(al or 0.0)
 
 
+def arm_label(a: str) -> str:
+    """Axis label for an arm. `8` is the control: the kernel runs and selects nothing different."""
+    k, _, pen = a.partition("p")
+    if k == "8":
+        return "keep=8\n(control: no\nsubstitution)"
+    return f"keep={k}" + ("\n+load balance" if pen and float(pen) else "")
+
+
 # The rule moves communication volume, which is `ib_b_per_tok` directly and
 # `tot_tok_per_s` at a prefill-heavy shape. On the bytes metric a negative row is the
 # rule working; on the rate metrics a positive one is.
@@ -34,15 +42,36 @@ METRIC = os.environ.get("METRIC") or "out_tok_per_s"
 
 
 def load(pat="runs/serve_*.json"):
+    """`(tag, rep)` -> arm -> record, keeping only the shape a tag was last swept at.
+
+    A tag accumulates artefacts across sweeps, and an arm from an earlier sweep at a smaller
+    step budget runs several times faster - mixing one into a launch would move a baseline by
+    more than the effect. So a record whose shape is not the tag's newest is dropped, not
+    paired."""
     runs = collections.defaultdict(dict)       # (tag, rep) -> arm -> record
-    skipped = 0
+    recs, newest = [], {}
     for f in glob.glob(pat):
         d = json.load(open(f))
         if d.get("written", "") < CUT:
-            skipped += 1
             continue
         m = re.match(r"serve_(.+)_([^_]+)_r(\d+)\.json$", os.path.basename(f))
-        runs[(m.group(1), int(m.group(3)))][m.group(2)] = d
+        if not re.fullmatch(r"base\d*|\d+(p[\d.]+)?", m.group(2)):
+            continue       # an arm from the pre-rename sweeps, e.g. `4a1`
+        shape = (d.get("prompt_len"), d.get("batch_tok"), d.get("n_req"))
+        recs.append((m.group(1), int(m.group(3)), m.group(2), shape, d))
+        if d["written"] > newest.get((m.group(1), shape), ("",))[0]:
+            newest[(m.group(1), shape)] = (d["written"], shape)
+    # Per tag, the shape of its most recently written artefact.
+    last = {}
+    for (tag, shape), (w, _) in newest.items():
+        if w > last.get(tag, ("",))[0]:
+            last[tag] = (w, shape)
+    skipped = 0
+    for tag, rep, arm, shape, d in recs:
+        if shape != last[tag][1]:
+            skipped += 1
+            continue
+        runs[(tag, rep)][arm] = d
     return runs, skipped
 
 
@@ -58,7 +87,7 @@ def main():
     # sweep shows up in the table without a second edit.
     keeps = sorted({a for arms in runs.values() for a in arms if not a.startswith("base")},
                    key=arm_key)
-    print(f"excluded {skipped} artefacts written before the kernel fix ({CUT})")
+    print(f"excluded {skipped} artefacts: pre-fix ({CUT}) or an older shape")
     print(f"metric: {METRIC}")
     per_tag = collections.defaultdict(lambda: collections.defaultdict(list))
     print(f"{'tag':8} {'btok':>5} {'rep':>3} {'nb':>2} {'base':>8} {'spread%':>7} "
