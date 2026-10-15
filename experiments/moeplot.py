@@ -130,7 +130,7 @@ def main() -> None:
     ax.axhspan(-band, band, color="0.82", zorder=0)
     ax.axhline(0, color="black", lw=0.7)
     ax.set_xticks(range(len(arms)), [arm_label(a) for a in arms])
-    ax.set_ylabel(f"{NAME} faster than stock routing (%)")
+    ax.set_ylabel(f"{NAME} faster than stock routing (%)\n" + r"$\uparrow$ higher is better")
     ax.set_title(f"Placement-aware refill of the bottom experts: {NAME} time in vLLM\n"
                  "DeepEP high-throughput all-to-all, prefill forwards, paired within launch",
                  fontsize=10)
@@ -139,8 +139,9 @@ def main() -> None:
     fig.tight_layout()
     fig.savefig(OUT, dpi=200)
 
-    rows = [f"| model | stock ms / {NAME.lower()} | tokens / forward | floor | "
-            + " | ".join(arm_label(a).replace("\n", " ") for a in arms) + " |",
+    rows = [f"| model | stock ms / {NAME.lower()} \u2193 | tokens / forward | "
+            "floor | " + " | ".join(arm_label(a).replace("\n", " ") + " \u2191"
+                                    for a in arms) + " |",
             "|---" * (len(arms) + 4) + "|"]
     for t in tags:
         # The launch count rides in the cell, not in one column: arms entered the grid at
@@ -159,7 +160,9 @@ def main() -> None:
         f"{NAME} time inside a running vLLM 0.31 engine on the DeepEP high-throughput "
         f"all-to-all, timed with CUDA events {where}, and reduced to a median per token-count "
         "bucket. Each arm is divided by the base arms of its own launch; `keep=8` "
-        "is the zero-substitution control. Positive is faster. The floor is that model's own "
+        "is the zero-substitution control. Positive is faster, so in every percentage column "
+        "higher is better (marked \u2191 in the header; \u2193 marks the one column where lower "
+        "is better). The floor is that model's own "
         "widest base-against-base spread, halved, over the launches in its row.\n\n"
         f"{md}\n")
     print(md)

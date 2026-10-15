@@ -11,3 +11,5 @@ runs/*
 !runs/serve.png
 !runs/serve.md
 __pycache__/
+!runs/combtime.png
+!runs/combtime.md

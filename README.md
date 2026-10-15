@@ -193,7 +193,7 @@ the zero-substitution control: the kernel runs and selects nothing different.
 ![In-engine DeepEP dispatch time](runs/disptime.png)
 
 <!-- disptime -->
-| model | stock ms / deepep dispatch | tokens / forward | floor | keep=8 (control: no substitution) | keep=6 | keep=6 +load balance | keep=4 | keep=4 +load balance |
+| model | stock ms / deepep dispatch ↓ | tokens / forward | floor | keep=8 (control: no substitution) ↑ | keep=6 ↑ | keep=6 +load balance ↑ | keep=4 ↑ | keep=4 +load balance ↑ |
 |---|---|---|---|---|---|---|---|---|
 | Qwen3-30B-A3B  E=128  ep=4 | 1.95 | 16384 | +/-0.36% | **+0.1%** x5 | **+0.7%** x5 | **+0.9%** x5 | **+3.8%** x4 | **+3.9%** x3 |
 | Qwen3.5-35B  E=256  ep=4 | 1.93 | 16384 | +/-0.16% | **-0.0%** x3 | **-0.3%** x2 | **-0.2%** x3 | **+2.7%** x2 | **+2.6%** x3 |
@@ -221,7 +221,7 @@ also what the load-balance term is for - adding the max-rank-load penalty to the
 (`PLACEMENT_LOAD_PENALTY=1`) keeps the dispatch saving and pays the skew back:
 
 <!-- moetime -->
-| model | stock ms / moe layer | tokens / forward | floor | keep=8 (control: no substitution) | keep=6 | keep=6 +load balance | keep=4 | keep=4 +load balance |
+| model | stock ms / moe layer ↓ | tokens / forward | floor | keep=8 (control: no substitution) ↑ | keep=6 ↑ | keep=6 +load balance ↑ | keep=4 ↑ | keep=4 +load balance ↑ |
 |---|---|---|---|---|---|---|---|---|
 | Qwen3-30B-A3B  E=128  ep=4 | 8.08 | 16384 | +/-0.20% | **-0.6%** x7 | **-2.1%** x7 | **+2.0%** x5 | **-5.1%** x6 | **-1.5%** x4 |
 | Qwen3.5-35B  E=256  ep=4 | 7.00 | 16384 | +/-0.22% | **-0.4%** x5 | **-1.8%** x4 | **+0.5%** x3 | **-2.0%** x4 | **-1.1%** x3 |
