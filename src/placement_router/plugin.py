@@ -111,24 +111,9 @@ def load_penalty() -> float:
     return _LOAD_PENALTY
 
 
-def _shim_remote_code() -> None:
-    """Hunyuan's vendored modelling file imports a transformers 4.x symbol that 5.x deleted.
-
-    vLLM 0.31 has no native Hunyuan-MoE implementation and serves it through the Transformers
-    backend, so `trust_remote_code` executes that file in every worker process - and a plugin
-    entry point is the only hook that runs there too. `False` skips the `torch.fx.wrap` branch
-    the symbol guards, which vLLM never traces anyway.
-    """
-    from transformers.utils import import_utils
-
-    if not hasattr(import_utils, "is_torch_fx_available"):
-        import_utils.is_torch_fx_available = lambda: False
-
-
 def register() -> None:
     """vLLM `general_plugins` entry point. Idempotent, and a no-op without `PLACEMENT_KEEP`."""
     global _KEEP, _LOAD_PENALTY
-    _shim_remote_code()
     # A measurement hook, loaded by path so nothing in this package depends on it. The model
     # runs in worker *processes*; a monkeypatch applied in the driver never reaches them, so an
     # in-engine probe has to be installed from here, which is where every worker arrives.

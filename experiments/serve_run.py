@@ -13,14 +13,12 @@ in attention selection (`No valid attention backend found ... PCP not supported`
 `is_sequence_parallel` itself requires data parallelism - so `dp_size > 1` is the only way in,
 and the offline `LLM` refuses it ("not supported for single-process usage and may hang").
 
-Hence a server. `vllm serve --data-parallel-size 2 --tensor-parallel-size 2
---enable-expert-parallel --all2all-backend deepep_high_throughput` is one process per rank,
-expert-parallel over all four GPUs, dispatching through DeepEP's token-sending path - which is
+Hence a server. `vllm serve --data-parallel-size 4 --enable-expert-parallel --all2all-backend
+deepep_high_throughput` is one process per rank, expert-parallel over all four GPUs, dispatching through DeepEP's token-sending path - which is
 both the configuration a real deployment uses and the one whose volume is `sum_t d(t)`, the
 quantity the rule shrinks.
 
-Throughput only. Accuracy is a property of the routing, which `accuracy.py` measures item by
-item on the same models; the all-to-all backend moves the same selections.
+The load it serves is what `moetime.py`, riding along via `PLACEMENT_PROBE`, times.
 """
 
 from __future__ import annotations
@@ -43,15 +41,6 @@ ARM = os.environ.get("ARM", "base")                   # base* | `keep` | `keep`p
 REP = os.environ.get("REP", "0")                      # which sweep; a launch is the unit
 N_GPUS = int(os.environ.get("GPUS", 4))
 DP = int(os.environ.get("DP", 2))
-# Expert parallelism spread over more than one node. DeepEP charges NVLink per distinct rank
-# but RDMA per distinct *node*, and inside a single node the top `keep` experts alone already
-# reach every node there is - so the fan-out the rule removes is all intra-node, and the
-# expensive tier barely moves. Only once the node count exceeds `keep` can the tail be
-# confined, which needs one pod per node: an indexed Job, rank 0 driving, the rest headless.
-NODES = int(os.environ.get("NODES", 1))
-RANK = int(os.environ.get("JOB_COMPLETION_INDEX", 0))
-HEAD = os.environ.get("HEAD", "127.0.0.1")
-RPC_PORT = int(os.environ.get("RPC_PORT", 5555))
 # `or`, not a `get` default: the job template exports every knob it knows about, so an
 # unset `A2A` arrives as the empty string and would reach vLLM as an invalid choice.
 A2A = os.environ.get("A2A") or "deepep_high_throughput"
@@ -80,31 +69,15 @@ assert N_GPUS % DP == 0, f"GPUS={N_GPUS} not divisible by DP={DP}"
 
 
 def cmdline() -> list[str]:
-    """The engine command. `DP` is per pod, so the engine's dp size is `DP * NODES` and the
-    expert-parallel world is the whole Job - every rank of it, head and peers alike."""
     cmd = ["vllm", "serve", MODEL, "--port", str(PORT),
-           "--data-parallel-size", str(DP * NODES),
-           "--data-parallel-size-local", str(DP),
+           "--data-parallel-size", str(DP),
            "--tensor-parallel-size", str(N_GPUS // DP),
            "--enable-expert-parallel", "--all2all-backend", A2A,
            "--trust-remote-code", "--max-model-len", str(MAX_LEN), "--seed", "0",
            "--max-num-batched-tokens", str(BATCH_TOK),
            "--no-enable-prefix-caching", "--disable-log-stats",
            "--gpu-memory-utilization", os.environ.get("GPU_UTIL", "0.90")]
-    if NODES > 1:
-        cmd += ["--data-parallel-address", HEAD, "--data-parallel-rpc-port", str(RPC_PORT)]
-        if RANK:
-            cmd += ["--headless", "--data-parallel-start-rank", str(RANK * DP)]
     return cmd
-
-
-def peer() -> None:
-    """A non-head pod. Holds its expert shards and routes its own tokens - so it needs the
-    same `PLACEMENT_KEEP` - but measures nothing. Exits when the head kills its engine between
-    arms, and `run.sh` restarts it for the next one."""
-    cmd = cmdline()
-    print("[peer] " + " ".join(cmd), flush=True)
-    raise SystemExit(subprocess.call(cmd))
 
 
 def serve() -> subprocess.Popen:
@@ -145,42 +118,20 @@ def post(prompt: list[int]) -> int:
         return json.load(r)["usage"]["completion_tokens"]
 
 
-# Every other number in this file is a time, and a time also moves when a launch is slow -
-# which is exactly the confound the keep==top_k control arm exists to absorb. These counters
-# are the one direct read of the quantity the routing rule actually changes. `port_xmit_data`
-# counts octets/4 per the IB spec, and is per *host*, so it includes the engine's own NCCL
-# traffic - the comparison that means anything is arm against arm within one launch.
-IB = sorted(pathlib.Path("/sys/class/infiniband").glob("*/ports/1/counters/port_xmit_data"))
-
-
-def ib_bytes() -> int:
-    """Bytes transmitted across every IB port this pod can see, or 0 where there are none."""
-    tot = 0
-    for c in IB:
-        try:
-            tot += int(c.read_text()) * 4
-        except (OSError, ValueError):
-            pass
-    return tot
-
-
 def throughput(prompts: list[list[int]]) -> list[dict]:
-    """Wall-clock and bytes for a fixed amount of work, all requests in flight at once."""
+    """Wall-clock for a fixed amount of work, all requests in flight at once."""
     out = []
     with cf.ThreadPoolExecutor(max_workers=N_REQ) as ex:
         for r in range(REPEATS):
-            b0, t0 = ib_bytes(), time.perf_counter()
+            t0 = time.perf_counter()
             n_out = sum(ex.map(post, prompts))
-            dt, db = time.perf_counter() - t0, ib_bytes() - b0
+            dt = time.perf_counter() - t0
             assert n_out == N_REQ * GEN_LEN, f"decoded {n_out}, expected {N_REQ * GEN_LEN}"
             n_tot = n_out + N_REQ * PROMPT_LEN
             out.append({"repeat": r, "seconds": dt, "out_tok_per_s": n_out / dt,
-                        "tot_tok_per_s": n_tot / dt,
-                        # The 32-bit counters wrap; a negative delta is a wrap, not a saving.
-                        "ib_gb": db / 1e9 if db >= 0 else None,
-                        "ib_b_per_tok": db / n_tot if db >= 0 else None})
+                        "tot_tok_per_s": n_tot / dt})
             print(f"  [{ARM}] repeat {r}: {dt:.2f}s  {n_out / dt:.1f} out-tok/s  "
-                  f"{n_tot / dt:.0f} tot-tok/s  {db / 1e9:.2f} GB IB", flush=True)
+                  f"{n_tot / dt:.0f} tot-tok/s", flush=True)
     return out
 
 
@@ -198,14 +149,11 @@ def main() -> None:
         os.environ["PLACEMENT_LOAD_PENALTY"] = str(load_penalty)
     print(f"[{TAG}/{ARM}] PLACEMENT_KEEP={os.environ.get('PLACEMENT_KEEP', '<unset>')} "
           f"PLACEMENT_LOAD_PENALTY={os.environ.get('PLACEMENT_LOAD_PENALTY', '<unset>')} gpus={N_GPUS} "
-          f"dp={DP * NODES} (local {DP}) tp={N_GPUS // DP} nodes={NODES} rank={RANK} "
-          f"a2a={A2A}", flush=True)
+          f"dp={DP} tp={N_GPUS // DP} a2a={A2A}", flush=True)
     # Rides along on every arm of every launch: two CUDA events per MoE forward, the same on
     # the base arms, and the only engine-level clock on the layer this rule actually moves.
     os.environ.setdefault("PLACEMENT_PROBE",
                           str(pathlib.Path(__file__).with_name("moetime.py")))
-    if RANK:
-        peer()
 
     # Fixed token ids rather than text, seeded: the batch has to
     # be identical across arms, and a prompt that tokenizes differently would not be.
@@ -224,7 +172,7 @@ def main() -> None:
     # diagnostic beside it did not, and read -40% when a cold repeat stayed in the set.
     top = max(r["out_tok_per_s"] for r in tp)
     warm = [r for r in tp if r["out_tok_per_s"] >= 0.8 * top] or tp[-1:]
-    med = lambda k: float(np.median(v)) if (v := [r[k] for r in warm if r[k] is not None]) else None
+    med = lambda k: float(np.median([r[k] for r in warm]))
 
     OUT.mkdir(exist_ok=True)
     (OUT / f"serve_{TAG}_{ARM}_r{REP}.json").write_text(json.dumps({
@@ -235,8 +183,8 @@ def main() -> None:
         "written": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "tag": TAG, "model": MODEL, "arm": ARM, "keep": keep, "load_penalty": load_penalty,
         "n_gpus": N_GPUS,
-        "vllm": __import__("vllm").__version__, "a2a": A2A, "dp": DP * NODES, "tp": N_GPUS // DP,
-        "nodes": NODES, "ep_size": N_GPUS * NODES,
+        "vllm": __import__("vllm").__version__, "a2a": A2A, "dp": DP, "tp": N_GPUS // DP,
+        "ep_size": N_GPUS,
         "n_req": N_REQ, "prompt_len": PROMPT_LEN, "gen_len": GEN_LEN,
         "batch_tok": BATCH_TOK, "max_len": MAX_LEN,
         "throughput": tp, "warm_tok_per_s": [r["out_tok_per_s"] for r in warm],
@@ -246,7 +194,6 @@ def main() -> None:
         # is large enough for `V / B_eff` to outweigh the fixed `L` - so at a prefill-heavy
         # shape this, not the decode rate, is the number the rule is predicted to move.
         "tot_tok_per_s": med("tot_tok_per_s"),
-        "ib_b_per_tok": med("ib_b_per_tok"),
     }, indent=1) + "\n")
     print(f"WROTE {OUT}/serve_{TAG}_{ARM}_r{REP}.json", flush=True)
 

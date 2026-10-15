@@ -1,24 +1,19 @@
-"""Finding and overriding a MoE router, across four families that agree on nothing.
+"""Finding and overriding a MoE router, across three families that agree on nothing.
 
-`accuracy.py` scores perplexity and `bench.py` scores a benchmark, but both need the exact
-same intervention: find every router, and make its top-k return the set `placement.py` chose.
-That intervention is subtle enough - three different gate contracts, four config vocabularies -
-that having it in one place is the only way both scripts are measuring the same thing.
+`accuracy.py` scores perplexity with every router's top-k forced to the set `placement.py` chose.
 
 The families differ in three ways that each need handling:
 
 * **where the config lives.** Qwen3.5 and Gemma 4 ship as multimodal wrappers whose
-  `text_config` carries the routing; Qwen3-30B and Hunyuan keep it at the top level.
-* **what the router module is.** Hunyuan's is an `nn.Linear` (`mlp.gate.wg`) returning plain
-  logits; transformers 5 made Qwen's a `*TopKRouter` holding a bare `nn.Parameter` and
+  `text_config` carries the routing; Qwen3-30B keeps it at the top level.
+* **what the router module is.** Transformers 5 made Qwen's a `*TopKRouter` holding a bare `nn.Parameter` and
   returning `(logits, scores, indices)`; Gemma 4's `Gemma4TextRouter` returns
   `(probs, weights, indices)` and does its projection in a child `nn.Linear` (`router.proj`).
   The child is the tempting hook - it puts the whole top-k downstream, so the plain-logits path
   appears to cover it - and it is the wrong one: Gemma's own `softmax -> topk -> /= sum ->
   * per_expert_scale` chain then runs on *masked* scores and reaches the same answer by a
-  different sequence of divisions, which in bf16 left the no-op arm 0.02 nat off the baseline
-  and flipped 12 benchmark items. So the parent is hooked and its tuple rebuilt here, exactly
-  as the Qwen routers are.
+  different sequence of divisions, which in bf16 left the no-op arm 0.02 nat off the baseline.
+  So the parent is hooked and its tuple rebuilt here, exactly as the Qwen routers are.
 * **what happens after the projection.** Every family softmaxes, takes top-k and renormalizes
   by the top-k sum. The renormalization is what makes logit masking exact rather than
   approximate: masking changes the softmax denominator, and dividing by the top-k sum divides
@@ -39,16 +34,14 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 import placement as P
 
-__all__ = ["arms_of", "install", "load", "moe_shapes", "routing_cfg", "text_cfg"]
+__all__ = ["arms_of", "install", "load", "routing_cfg", "text_cfg"]
 
 
 def pick(cfg, *names, default: int | None = None) -> int:
     """The first field the config actually spells, as an int.
 
-    Hunyuan stores its MoE fields as single-element lists (one entry per layer group) where the
-    others store ints. For the routing fields, guessing wrong would mis-size the GPU block map
-    and quietly route to the wrong devices, so an unknown spelling is a hard stop; `default` is
-    for fields a family may legitimately not have at all, such as a shared expert.
+    An unknown spelling of a routing field is a hard stop: guessing would mis-size the GPU block
+    map. `default` is for fields a family may legitimately not have.
     """
     for n in names:
         v = getattr(cfg, n, None)
@@ -75,24 +68,6 @@ def routing_cfg(model_path: str, n_gpus: int):
     return cfg, n_experts, top_k
 
 
-def moe_shapes(cfg) -> dict:
-    """The widths Phase B needs to rebuild one expert-parallel layer.
-
-    `shared_inter` is the total width of the **always-on** path, and it is load-bearing rather
-    than cosmetic: it adds compute on the token's own GPU and no communication at all, so
-    omitting it inflates the communication fraction and overstates this experiment's benefit on
-    exactly the models that have one. Hunyuan spells it as a shared expert; Gemma 4 does not
-    call it that but every MoE layer still runs a full dense MLP beside the experts, which is
-    the same thing for this accounting.
-    """
-    moe_inter = pick(cfg, "moe_intermediate_size", "intermediate_size")
-    shared = (pick(cfg, "shared_expert_intermediate_size", default=0)
-              or pick(cfg, "num_shared_expert", "n_shared_experts", default=0) * moe_inter
-              or (pick(cfg, "intermediate_size", default=0)
-                  if getattr(cfg, "enable_moe_block", False) else 0))
-    return {"hidden": int(cfg.hidden_size), "moe_inter": moe_inter, "shared_inter": shared}
-
-
 def load(model_path: str):
     """The model on all visible GPUs, in bf16, with expert dropping disabled."""
     try:
@@ -104,17 +79,6 @@ def load(model_path: str):
         model = AutoModelForImageTextToText.from_pretrained(
             model_path, dtype=torch.bfloat16, device_map="auto", trust_remote_code=True)
     model.eval()
-    # Scoring is teacher-forced everywhere in this repo, so the cache is only ever dead weight
-    # - but turning it off is not free on every family, so it is turned off only where it is a
-    # workaround. Hunyuan's vendored modelling code calls a `DynamicCache` method transformers
-    # has since removed, so it cannot run with one. Gemma 4 can: forcing it off there moved the
-    # baseline NLL from 5.854 to 10.750 and the benchmark to chance, because its sliding-window
-    # layers build their attention mask down a different path when there is no cache to measure
-    # against.
-    if "hunyuan" in f"{type(model).__name__} {getattr(model.config, 'model_type', '')}".lower():
-        model.config.use_cache = False
-    import hunyuan_capacity
-    print(f"capacity patch applied: {hunyuan_capacity.no_drop_moe(model)}", flush=True)
     return model
 
 
@@ -149,7 +113,7 @@ def install(model, n_experts: int, top_k: int, hidden: int, n_gpus: int,
     `state["arm"]` is one of `baseline` / `placement` / `random` and `state["keep"]` is how many
     top ranks are chosen by score; `placement` at `keep == top_k` is the no-op arm. `changed`
     and `rows` accumulate the fired fraction, and `trace`, when a dict, collects up to
-    `trace_tokens` of routing per layer for Phase B to replay.
+    `trace_tokens` of routing per layer for the fan-out count.
     """
     gates = routers(model, n_experts, hidden)
     assert gates, f"found no [{n_experts}, {hidden}] router projection"

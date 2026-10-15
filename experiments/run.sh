@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Every measurement for one model. `PY` is the interpreter to use (the pod sets it to a
-# transformers-4.x venv for Hunyuan's HF path); `GPUS` must match the Phase A trace.
+# Every measurement for one model. `PY` is the interpreter to use.
 #
 #   MODEL=/models/bf16 TAG=q30rh ./run.sh                   # offline: paired NLL per arm
 #   MODEL=/models/bf16 TAG=q30rh ARMS=base,base2,4 ./run.sh # real: one vllm serve per arm
@@ -9,29 +8,6 @@ PY="${PY:-python3}"
 # Run from the repo root so every script writes to the one `runs/`, while sys.path[0] stays
 # the script's own directory and the `import placement` siblings keep resolving.
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-
-# One IB device, named - and which one it is depends on the pod, so it is resolved here rather
-# than passed in. `nvidia.com/gpu: 1` out of eight hands each rank an arbitrary GPU, and
-# GPU-initiated RDMA wants the NIC under the same PCIe root: on the host we probed the granted
-# GPU sat at 3b:00.0, which `nvidia-smi topo -m` puts PIX to `ibp1` and NODE to the other
-# seven - so the `ibp0` we had been pinning every rank to was the wrong device on that rank.
-# `eth0` is beside it because UCX needs `tcp` for the NIXL agent metadata exchange, and `tcp`
-# with no netdev of its own is what brought `loadRemoteMD` -3 back.
-# Only when this pod was granted exactly one GPU: with several there is no single right NIC,
-# and `head -1` would close the pipe while `nvidia-smi` was still writing - SIGPIPE under
-# `pipefail` killed the first multi-GPU run here at exit 141. `sed -n 1p` reads to EOF.
-if [ -z "${UCX_NET_DEVICES:-}" ] && [ "$(nvidia-smi -L | wc -l)" = "1" ] \
-   && [ -n "$(ls -d /sys/class/infiniband/ibp* 2>/dev/null)" ]; then
-  gpu="$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader | sed -n 1p | cut -d: -f2- \
-         | tr 'A-Z' 'a-z')"
-  root="$(readlink -f "/sys/bus/pci/devices/0000:${gpu}" | cut -d/ -f4)"
-  for d in /sys/class/infiniband/ibp*; do
-    [ "$(readlink -f "${d}/device" | cut -d/ -f4)" = "${root}" ] || continue
-    export UCX_NET_DEVICES="$(basename "${d}"):1,eth0"
-    break
-  done
-  echo "gpu ${gpu} under ${root} -> UCX_NET_DEVICES=${UCX_NET_DEVICES:-<none local>}"
-fi
 
 if [ -n "${ARMS:-}" ]; then
   # Installed from a copy, not from /results: the entry point has to be importable in every
@@ -53,33 +29,12 @@ if [ -n "${ARMS:-}" ]; then
   # whatever drifts between launches lands on all arms rather than on whichever ran first.
   # REP0 offsets the index so a second job can add sweeps to a tag already measured
   # instead of overwriting its files.
-  # Multi-node expert parallelism is one pod per node (an indexed Job), and only rank 0
-  # benchmarks. The peers hold expert shards and route their own tokens, so they need the
-  # arm's PLACEMENT_KEEP too - the head publishes it to the shared PVC before each arm. A peer's
-  # engine dies when the head kills its own between arms, which is the restart signal.
   mkdir -p runs
-  sent="runs/mn_${TAG}.arm"
-  if [ "${JOB_COMPLETION_INDEX:-0}" != "0" ]; then
-    while :; do
-      arm="$(cat "${sent}" 2>/dev/null || echo wait)"
-      case "${arm}" in
-        done) exit 0 ;;
-        wait) sleep 5; continue ;;
-      esac
-      ARM="${arm}" "${PY}" experiments/serve_run.py || true
-      sleep 5
-    done
-  fi
-  [ "${NODES:-1}" = "1" ] || echo wait > "${sent}"
   for rep in $(seq "${REP0:-0}" $(( ${REP0:-0} + ${REPS:-1} - 1 ))); do
     for arm in ${ARMS//,/ }; do
-      # Published first, then a pause: the peers still running the previous arm have to see
-      # their engine go away and come back on this one before the head waits for /health.
-      [ "${NODES:-1}" = "1" ] || { echo "${arm}" > "${sent}"; sleep 30; }
       REP="${rep}" ARM="${arm}" "${PY}" "${script}"
     done
   done
-  [ "${NODES:-1}" = "1" ] || echo done > "${sent}"
   exit 0
 fi
 

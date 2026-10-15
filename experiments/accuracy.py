@@ -1,4 +1,4 @@
-"""Phase A: what placement-aware re-routing costs in NLL, and the routing it produces.
+"""What placement-aware re-routing costs in NLL, and the routing it produces.
 
 One process, four GPUs via `device_map="auto"`. For each arm the router logits of every MoE
 layer are masked (see `placement.py` for the rule, `moe.py` for the hook) and the model is
@@ -26,9 +26,7 @@ Three things make the numbers here trustworthy rather than merely produced:
 * a **random control** making the same number of substitutions with no placement benefit, which
   separates "the bottom experts do not matter" from "our choice of replacement is good".
 
-Writes `runs/acc_<tag>.json` and the routing traces `runs/trace_<tag>.npz`, which Phase B
-replays on real NCCL collectives. `bench.py` scores the same arms on a benchmark; perplexity
-alone cannot tell you whether the model can still do the task.
+Writes `runs/acc_<tag>.json`.
 """
 
 from __future__ import annotations
@@ -54,11 +52,7 @@ KEEPS = tuple(int(x) for x in os.environ.get("KEEPS", "6,4,2").split(","))
 STREAM = os.environ.get("STREAM", "multilingual")
 STREAMS = os.environ.get("STREAMS", "/results/streams")
 TOKREF = os.environ.get("TOKREF", "/models/qwen_tok")
-# Tokens of routing kept per layer, for Phase B to draw replay batches from. It only has to
-# represent the routing *distribution*, but it also bounds Phase B's largest replay batch - a
-# step consumes `B` tokens of one layer's trace - and the benefit only shows up once the
-# dispatch is bandwidth-bound, so this is sized to the largest batch Phase B times. At int16
-# it is ~12 MB for 48 layers.
+# Tokens of routing kept per layer for the fan-out count.
 TRACE_TOKENS = int(os.environ.get("TRACE_TOKENS", 16384))
 OUT = pathlib.Path("runs")
 
@@ -98,14 +92,13 @@ def per_window_nll(model, win: np.ndarray) -> list[float]:
 def main() -> None:
     cfg, n_experts, top_k = moe.routing_cfg(MODEL, N_GPUS)
     print(f"{TAG}: E={n_experts} top_k={top_k} G={N_GPUS}", flush=True)
-    shapes = moe.moe_shapes(cfg)
     model = moe.load(MODEL)
-    state, handles = moe.install(model, n_experts, top_k, shapes["hidden"], N_GPUS,
+    state, handles = moe.install(model, n_experts, top_k, int(cfg.hidden_size), N_GPUS,
                                  trace_tokens=TRACE_TOKENS)
 
     win = token_ids((N_WIN + 1) * SEQ_LEN)[: N_WIN * SEQ_LEN].reshape(N_WIN, SEQ_LEN)
     results: dict[str, dict] = {}
-    traces: dict[str, np.ndarray] = {}
+    n_layers = 0
     gpu_cpu = P.gpu_of(n_experts, N_GPUS)
     for name, arm, keep in moe.arms_of(top_k, KEEPS):
         # The random control draws its substitutes from the global generator, so without this
@@ -118,7 +111,7 @@ def main() -> None:
 
         tr = torch.stack([torch.cat(state["trace"][k])[:TRACE_TOKENS]
                           for k in sorted(state["trace"])])          # [layers, tokens, top_k]
-        traces[name] = tr.numpy()
+        n_layers = tr.shape[0]
         fan = P.fanout(tr.reshape(-1, top_k), gpu_cpu, N_GPUS).float().mean().item()
 
         d = np.array(pw) - np.array(results["baseline"]["per_window"]) if results else np.zeros(N_WIN)
@@ -171,17 +164,14 @@ def main() -> None:
         "top_k": top_k, "n_gpus": N_GPUS,
         # Hooked and fired differ when a family carries a router that never runs during
         # scoring, such as Qwen3.5's multi-token-prediction head.
-        "n_routers_hooked": state["n_routers"], "n_moe_layers": len(traces["baseline"]),
+        "n_routers_hooked": state["n_routers"], "n_moe_layers": n_layers,
         "n_windows": N_WIN, "seq_len": SEQ_LEN,
         # The repeat baseline, promoted out of `arms` so a reader cannot miss what every delta
         # here has to be larger than to mean anything.
         "noise_floor": {"dnll": floor["dnll"], "dnll_se": floor["dnll_se"], "t": floor["t"]},
-        # Phase B rebuilds the expert shapes from these, so it needs only `runs/`.
-        **shapes,
         "arms": results,
     }, indent=1) + "\n")
-    np.savez_compressed(OUT / f"trace_{TAG}.npz", **traces)
-    print(f"WROTE {OUT}/acc_{TAG}.json {OUT}/trace_{TAG}.npz", flush=True)
+    print(f"WROTE {OUT}/acc_{TAG}.json", flush=True)
 
 
 if __name__ == "__main__":

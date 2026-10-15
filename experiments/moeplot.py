@@ -3,9 +3,8 @@
     python3 experiments/moeplot.py
 
 Reads `runs/moetime_{tag}_{arm}_r{rep}_{rank}.json` written by `moetime.py` riding along on
-every serve launch. Same unit of analysis as `paired.py`: an arm is divided by the base arms of
-*its own launch*, because an unmodified engine loaded twice measured several percent against
-itself.
+every serve launch. An arm is divided by the base arms of *its own launch*, because an
+unmodified engine loaded twice measured several percent against itself.
 
 The bucket reported is the largest token count both the arm and its baseline recorded - the
 prefill forward, where the all-to-all is bandwidth-bound and the byte saving can pay. Expert
@@ -29,7 +28,20 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from paired import arm_key, arm_label  # noqa: E402
+
+def arm_key(a):
+    """`4` is keep=4, `4p0.5` is keep=4 with the load penalty. Descending keep, ascending load_penalty."""
+    k, _, al = a.partition("p")
+    return -int(k), float(al or 0.0)
+
+
+def arm_label(a: str) -> str:
+    """Axis label for an arm. `8` is the control: the kernel runs and selects nothing different."""
+    k, _, pen = a.partition("p")
+    if k == "8":
+        return "keep=8\n(control: no\nsubstitution)"
+    return f"keep={k}" + ("\n+load balance" if pen and float(pen) else "")
+
 
 # Which span to plot: the whole MoE layer, or one half of the collective. The whole layer nets
 # the byte saving against the expert GEMM, whose grouped group sizes skew when the allowed

@@ -3,7 +3,6 @@
 #
 #   ./launch.sh NAME=q30 TAG=q30rh MODEL=/models/bf16
 #   ./launch.sh NAME=q35 TAG=q35   MODEL=/models/q35_bf16
-#   ./launch.sh NAME=hy  TAG=hy13b MODEL=/models/hy_bf16 TF4=1 BATCH=1
 #   ./launch.sh NAME=gm  TAG=gm26b MODEL=/models/gm_bf16
 #
 # `ARMS=base,base2,8,6,6p1,4,4p1,base3` switches the job to the in-engine measurement, one
@@ -14,51 +13,23 @@
 #
 # Add `NODE=<hostname>` to pin a run to one node, which is how you get off a node whose GPU
 # has fallen off the bus - the packing scheduler is deterministic and will keep choosing it.
-#
-# `NODES=4 GPUS=2 DP=2` is one pod per node, ep_size = DP * NODES = 8, spread over 4 hosts.
-# That is the shape this kernel needs to pay: DeepEP charges RDMA per distinct *node*, and
-# inside one node the top `keep` experts already reach every node, so a fan-out saving there
-# lands entirely on NVLink. There is no threshold, only saturation: the tail can be confined
-# once a tier has more destinations than the top `keep` already reach, which at 2 nodes it
-# does not and at 8 it does.
+# `BAD` names the hosts to avoid; the default is the two unusable ones on this cluster.
 #
 # Syncing the code is deliberately a separate step - the results PVC is shared, so a launch
 # does not overwrite it behind your back:
 #
 #   oc cp . <pod>:/results/placement-router
-#
-# On CoreWeave the same step is `kubectl cp`, and the claim carries the weights too:
-#
-#   KCTL='kubectl --context=waldorf_US-EAST-04A -n almogtavor-dev' TPL=job-cw.yaml \
-#     NS=almogtavor-dev CLAIM=placement-cw BAD=gd91fda ./launch.sh NAME=q30mn TAG=q30mn \
-#     MODEL=/results/models/q30 NODES=4 GPUS=1 DP=1 MEM=200Gi \
-#     A2A=nixl_ep ARMS=base,base2,4,base3
-#
-# `nixl_ep`, not `deepep_high_throughput`, at one GPU per node: DeepEP computes `nvl_rank =
-# rank % 8` and `rdma_rank = rank / 8` unconditionally, so its only legal shapes are one node
-# with ep <= 8 or several nodes with exactly 8 GPUs each. One GPU per node asserts in HT and
-# dies in `cudaIpcOpenMemHandle` in LL. `nixl_ep` has the same dispatch contract and no such
-# constraint, which makes it the only backend that runs this shape.
-#
-# `BAD` is per-cluster, so pass it: the default names the two unusable OpenShift hosts. Four
-# arms rather than six because only `keep=4` has a predicted RDMA saving at ep=4, and three
-# base launches measure the launch-to-launch spread it has to clear.
 set -euo pipefail
 
 : "${NAME:=}" ; : "${TAG:=}" ; : "${MODEL:=}"
-: "${GPUS:=4}" ; : "${MEM:=700Gi}" ; : "${TF4:=0}" ; : "${TFVER:=4.57.1}"
+: "${GPUS:=4}" ; : "${MEM:=700Gi}"
 : "${BATCH:=4}" ; : "${NWIN:=32}" ; : "${KEEPS:=6,4,2}"
 : "${STREAM:=multilingual}" ; : "${TOKREF:=/models/qwen_tok}" ; : "${NODE:=}"
 : "${N_REQ:=256}" ; : "${PROMPT_LEN:=1024}" ; : "${GEN_LEN:=128}" ; : "${REPEATS:=6}"
 : "${GPU_UTIL:=0.90}"
 : "${BATCH_TOK:=0}"   # 0 = serve_run picks max(MAX_LEN, 2048); vLLM's own DP default is 256
-: "${NODES:=1}" ; : "${BAD:=pokprod-b93r43s1, pokprod-b93r38s0}"
+: "${BAD:=pokprod-b93r43s1, pokprod-b93r38s0}"
 : "${PENS:=0,1}" ; : "${ARMS:=}" ; : "${SCRIPT:=}" ; : "${IMG:=v0.31.0}" ; : "${A2A:=}" ; : "${DP:=2}" ; : "${REPS:=1}" ; : "${REP0:=0}"
-# Which cluster. The defaults are the OpenShift one, whose template carries its namespace and
-# model PVCs as literals; `TPL=job-cw.yaml` is the CoreWeave multi-node shape, which takes
-# both as variables because neither pre-exists there.
-: "${KCTL:=oc}" ; : "${TPL:=job.yaml}"
-: "${NS:=llm-d-pic}" ; : "${CLAIM:=kvcache-bench-results-almogtavor}"
 
 for kv in "$@"; do export "${kv?}"; done
 [ -n "${NAME}" ] && [ -n "${TAG}" ] && [ -n "${MODEL}" ] || {
@@ -66,14 +37,10 @@ for kv in "$@"; do export "${kv?}"; done
 
 # `nodeSelector: {${NODE}}`, so the pin is a whole `key: value` pair, not just a hostname.
 NODE="${NODE:+kubernetes.io/hostname: ${NODE}}"
-export NAME TAG MODEL GPUS MEM TF4 TFVER BATCH NWIN KEEPS STREAM TOKREF NODE PENS ARMS SCRIPT IMG A2A DP REPS REP0
-export NODES BAD NS CLAIM
-export N_REQ PROMPT_LEN GEN_LEN REPEATS BATCH_TOK GPU_UTIL
-# Internode NVSHMEM knobs, parameterised because which RDMA transport a cluster
-# actually lets a pod open is a property of the cluster, not of the experiment.
-export IBGDA="${IBGDA:-1}" NIC_HANDLER="${NIC_HANDLER:-gpu}" NVSHMEM_DEBUG="${NVSHMEM_DEBUG:-WARN}"
+export NAME TAG MODEL GPUS MEM BATCH NWIN KEEPS STREAM TOKREF NODE PENS ARMS SCRIPT IMG A2A DP REPS REP0
+export N_REQ PROMPT_LEN GEN_LEN REPEATS BATCH_TOK GPU_UTIL BAD
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-${KCTL} delete job "placement-${NAME}" --ignore-not-found >/dev/null
-envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $PENS $ARMS $SCRIPT $IMG $A2A $DP $REPS $REP0 $N_REQ $PROMPT_LEN $GEN_LEN $REPEATS $BATCH_TOK $GPU_UTIL $NODES $BAD $NS $CLAIM $IBGDA $NIC_HANDLER $NVSHMEM_DEBUG' \
-  < "${here}/${TPL}" | ${KCTL} apply -f -
-echo "launched placement-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} tf4=${TF4} arms=${ARMS:-offline} a2a=${A2A:-default} dp=${DP} reps=${REPS} rep0=${REP0} shape=${N_REQ}x${PROMPT_LEN}/${GEN_LEN} btok=${BATCH_TOK} nodes=${NODES} ep=$(( GPUS * NODES ))"
+oc delete job "placement-${NAME}" --ignore-not-found >/dev/null
+envsubst '$NAME $TAG $MODEL $GPUS $MEM $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $PENS $ARMS $SCRIPT $IMG $A2A $DP $REPS $REP0 $N_REQ $PROMPT_LEN $GEN_LEN $REPEATS $BATCH_TOK $GPU_UTIL $BAD' \
+  < "${here}/job.yaml" | oc apply -f -
+echo "launched placement-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} arms=${ARMS:-offline} a2a=${A2A:-default} dp=${DP} reps=${REPS} rep0=${REP0} shape=${N_REQ}x${PROMPT_LEN}/${GEN_LEN} btok=${BATCH_TOK}"
