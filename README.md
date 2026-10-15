@@ -195,23 +195,23 @@ the zero-substitution control: the kernel runs and selects nothing different.
 <!-- disptime -->
 | model | stock ms / deepep dispatch | tokens / forward | floor | keep=8 (control: no substitution) | keep=6 | keep=6 +load balance | keep=4 | keep=4 +load balance |
 |---|---|---|---|---|---|---|---|---|
-| Qwen3-30B-A3B  E=128  ep=4 | 1.95 | 16384 | +/-0.36% | **+0.1%** x5 | **+0.8%** x5 | **+0.9%** x5 | **+3.8%** x3 | **+3.8%** x2 |
+| Qwen3-30B-A3B  E=128  ep=4 | 1.95 | 16384 | +/-0.36% | **+0.1%** x5 | **+0.7%** x5 | **+0.9%** x5 | **+3.8%** x4 | **+3.9%** x3 |
 | Qwen3.5-35B  E=256  ep=4 | 1.93 | 16384 | +/-0.16% | **-0.0%** x3 | **-0.3%** x2 | **-0.2%** x3 | **+2.7%** x2 | **+2.6%** x3 |
-| Gemma-4-26B-A4B  E=128  ep=4 | 2.16 | 16384 | +/-0.05% | **+0.1%** x2 | **+0.6%** x3 | **+0.6%** x2 | **+3.9%** x1 | **+3.6%** x2 |
+| Gemma-4-26B-A4B  E=128  ep=4 | 2.15 | 16384 | +/-0.16% | **-0.0%** x2 | **+0.6%** x3 | **+0.6%** x2 | **+3.8%** x2 | **+3.6%** x3 |
 | Qwen3-30B-A3B  E=128  ep=4  (host B) | 1.81 | 16384 | +/-0.05% | **+0.0%** x4 | **+1.0%** x4 | **+0.9%** x4 | **+4.1%** x4 | **+4.2%** x4 |
-| Qwen3-30B-A3B  E=128  ep=8  (host B) | 2.23 | 16384 | +/-0.11% | **+0.1%** x5 | **+4.1%** x5 | **+4.0%** x7 | **+10.5%** x4 | **+10.5%** x4 |
+| Qwen3-30B-A3B  E=128  ep=8  (host B) | 2.23 | 16384 | +/-0.11% | **+0.0%** x7 | **+4.1%** x7 | **+4.0%** x9 | **+10.4%** x6 | **+10.4%** x6 |
 <!-- /disptime -->
 
 The numbers are the 16384-token prefill bucket, `x`n is how many independent launches each cell
 averages, and positive is faster. The floor is per row, because a cell is only ever divided by
 launches of its own tag: it is that row's widest base-against-base spread, halved. Four things
 make this the rule rather than the instrument. The full substitution budget, `keep=4`, is faster
-on every row and every family, from +2.6% to +10.5%. The zero-substitution control is not (-0.0%
+on every row and every family, from +2.6% to +10.4%. The zero-substitution control is not (-0.0%
 to +0.1%), so the kernel's own cost is not what is being measured. The step from `keep=6` to
 `keep=4` is many times the floor in all five rows. And the last two rows are the same model on the
 same host type at two world sizes, so the `ep` step can be read without crossing clusters: 0.9%
-becomes 4.0% at `keep=6`, 4.1% becomes 10.5% at `keep=4`. That is what a fan-out saving has to do, since
-a wider world gives a fixed `keep` more distinct ranks to avoid visiting.
+becomes 4.0% at `keep=6`, 4.1% becomes 10.4% at `keep=4`. That is what a fan-out saving has to
+do, since a wider world gives a fixed `keep` more distinct ranks to avoid visiting.
 
 Timing dispatch separately is not a convenience. The whole-layer clock nets the byte saving
 against the expert GEMM, and that GEMM is grouped: restricting the allowed expert set skews the
@@ -223,11 +223,11 @@ also what the load-balance term is for - adding the max-rank-load penalty to the
 <!-- moetime -->
 | model | stock ms / moe layer | tokens / forward | floor | keep=8 (control: no substitution) | keep=6 | keep=6 +load balance | keep=4 | keep=4 +load balance |
 |---|---|---|---|---|---|---|---|---|
-| Qwen3-30B-A3B  E=128  ep=4 | 8.08 | 16384 | +/-0.20% | **-0.6%** x7 | **-2.1%** x7 | **+2.0%** x5 | **-5.2%** x5 | **-1.6%** x3 |
+| Qwen3-30B-A3B  E=128  ep=4 | 8.08 | 16384 | +/-0.20% | **-0.6%** x7 | **-2.1%** x7 | **+2.0%** x5 | **-5.1%** x6 | **-1.5%** x4 |
 | Qwen3.5-35B  E=256  ep=4 | 7.00 | 16384 | +/-0.22% | **-0.4%** x5 | **-1.8%** x4 | **+0.5%** x3 | **-2.0%** x4 | **-1.1%** x3 |
-| Gemma-4-26B-A4B  E=128  ep=4 | 9.72 | 16384 | +/-0.14% | **-0.3%** x3 | **-1.9%** x4 | **+3.2%** x2 | **-5.2%** x2 | **-0.2%** x2 |
+| Gemma-4-26B-A4B  E=128  ep=4 | 9.72 | 16384 | +/-0.14% | **-0.3%** x3 | **-1.9%** x4 | **+3.2%** x2 | **-5.4%** x3 | **-0.3%** x3 |
 | Qwen3-30B-A3B  E=128  ep=4  (host B) | 7.56 | 16384 | +/-0.08% | **-0.6%** x4 | **-2.3%** x4 | **+1.9%** x4 | **-5.3%** x4 | **-1.9%** x4 |
-| Qwen3-30B-A3B  E=128  ep=8  (host B) | 11.17 | 16384 | +/-0.52% | **-0.1%** x6 | **-2.6%** x5 | **+0.4%** x8 | **-6.2%** x4 | **-1.5%** x5 |
+| Qwen3-30B-A3B  E=128  ep=8  (host B) | 11.17 | 16384 | +/-0.52% | **-0.1%** x8 | **-2.7%** x7 | **+0.4%** x10 | **-6.4%** x6 | **-1.8%** x7 |
 <!-- /moetime -->
 
 `keep=6` with the load-balance term is the only arm that clears the floor on the whole-layer
