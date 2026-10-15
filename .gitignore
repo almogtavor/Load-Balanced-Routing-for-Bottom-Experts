@@ -5,6 +5,7 @@ runs/*
 !runs/combtime.md
 !runs/moetime.png
 !runs/moetime.md
+!runs/lbgain.md
 __pycache__/
 .env
 .DS_Store

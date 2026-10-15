@@ -49,7 +49,8 @@ What reaches the whole layer is set by the *other* half of the collective. Combi
 experiments/k8s/launch.sh NAME=q30 TAG=q30pf MODEL=/models/bf16 DP=4 \
   A2A=deepep_high_throughput ARMS=base,base2,8,6,6p1,4,4p1,base3
 for ph in moe disp comb; do PHASE=$ph PYTHONPATH=experiments python experiments/moeplot.py; done
+PYTHONPATH=experiments python experiments/lbgain.py   # the load term against the plain rule, same launch
 python3 -I experiments/readme_tables.py
 ```
 
-`kernel.py` is the rule - Triton kernel, torch reference, fan-out metric, self-check - and `plugin.py` the hook. `moetime.py` are the in-engine timers, `moeplot.py` pairs them within launch against the measured floor, `imbalance.py` reads fan-out and per-rank load off the real router per `(ep, keep, load_penalty)` arm, `accuracy.py` the paired NLL cost. Prior art for substituting the bottom of the selection, and for the restricted-set reroute: arXiv 2412.00099, 2504.01337, 2505.13345; that the bottom of the selection is the uncertain part of it: arXiv 2602.02443.
+`kernel.py` is the rule - Triton kernel, torch reference, fan-out metric, self-check - and `plugin.py` the hook. `moetime.py` are the in-engine timers, `moeplot.py` pairs them within launch against the measured floor, `imbalance.py` reads fan-out and per-rank load off the real router per `(ep, keep, load_penalty)` arm, `lbgain.py` the load term's own gain, `accuracy.py` the paired NLL cost. Prior art for substituting the bottom of the selection, and for the restricted-set reroute: arXiv 2412.00099, 2504.01337, 2505.13345; that the bottom of the selection is the uncertain part of it: arXiv 2602.02443.
