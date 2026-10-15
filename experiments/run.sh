@@ -2,8 +2,8 @@
 # Every measurement for one model. `PY` is the interpreter to use (the pod sets it to a
 # transformers-4.x venv for Hunyuan's HF path); `GPUS` must match the Phase A trace.
 #
-#   MODEL=/models/bf16 TAG=q30rh ./run.sh                   # offline: accuracy, bench, latency
-#   MODEL=/models/bf16 TAG=q30rh ARMS=base,base2,4 ./run.sh # real: vLLM, one engine per arm
+#   MODEL=/models/bf16 TAG=q30rh ./run.sh                   # offline: paired NLL per arm
+#   MODEL=/models/bf16 TAG=q30rh ARMS=base,base2,4 ./run.sh # real: one vllm serve per arm
 set -xeuo pipefail
 PY="${PY:-python3}"
 # Run from the repo root so every script writes to the one `runs/`, while sys.path[0] stays
@@ -41,13 +41,11 @@ if [ -n "${ARMS:-}" ]; then
   # The Triton path has no CPU fallback to be checked against on a laptop, so the first thing
   # a GPU job does is prove it agrees with the reference on this hardware.
   "${PY}" src/placement_router/kernel.py
-  # SERVE=1 measures through a real `vllm serve` instead of the offline API, which is the
-  # only way to reach the DeepEP dispatch - see the header of serve_run.py.
-  # SCRIPT names a one-off measurement to run instead of the arm sweep (imbalance.py scores
-  # every arm inside one engine load, so it wants ARMS=<anything> only to enter this path).
-  if [ -n "${SCRIPT:-}" ]; then script="${SCRIPT}"
-  elif [ "${SERVE:-0}" = "1" ]; then script=experiments/serve_run.py
-  else script=experiments/vllm_run.py; fi
+  # A real `vllm serve` is the only shape vLLM 0.31 builds the DeepEP all-to-all in - see the
+  # header of serve_run.py. SCRIPT names a one-off measurement to run instead of the arm sweep
+  # (imbalance.py scores every arm inside one engine load, so it wants ARMS=<anything> only to
+  # enter this path).
+  script="${SCRIPT:-experiments/serve_run.py}"
   # `base` and `base2` are the same configuration launched twice, and on the first clean
   # sweep they disagreed by 5.3% while the warm repeats inside each launch spread 0.8%. So a
   # launch is the unit of analysis, not a repeat: repeats measure one engine's steady state,
@@ -86,5 +84,3 @@ if [ -n "${ARMS:-}" ]; then
 fi
 
 "${PY}" experiments/accuracy.py
-"${PY}" experiments/bench.py
-"${PY}" -m torch.distributed.run --nproc_per_node="${GPUS:-4}" experiments/latency.py

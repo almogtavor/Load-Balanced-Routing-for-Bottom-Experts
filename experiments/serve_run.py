@@ -1,7 +1,7 @@
 """One arm of the DeepEP measurement: a real `vllm serve`, loaded over HTTP.
 
-`vllm_run.py` cannot reach the backend this kernel exists for. vLLM 0.31 builds all-to-all
-kernels only when expert parallelism is paired with data or prefill-context parallelism:
+The offline `LLM` API cannot reach the backend this kernel exists for. vLLM 0.31 builds
+all-to-all kernels only when expert parallelism is paired with data or prefill-context parallelism:
 
     use_all2all_kernels = use_ep and (dp_size > 1 or pcp_size > 1 or is_sequence_parallel)
       -- vllm/model_executor/layers/fused_moe/config.py
@@ -19,8 +19,8 @@ expert-parallel over all four GPUs, dispatching through DeepEP's token-sending p
 both the configuration a real deployment uses and the one whose volume is `sum_t d(t)`, the
 quantity the rule shrinks.
 
-Throughput only. Accuracy is a property of the routing, which is what `vllm_run.py` measures
-item by item on the same models; the all-to-all backend moves the same selections.
+Throughput only. Accuracy is a property of the routing, which `accuracy.py` measures item by
+item on the same models; the all-to-all backend moves the same selections.
 """
 
 from __future__ import annotations
@@ -207,7 +207,7 @@ def main() -> None:
     if RANK:
         peer()
 
-    # Fixed token ids rather than text, with the same seed as `vllm_run.py`: the batch has to
+    # Fixed token ids rather than text, seeded: the batch has to
     # be identical across arms, and a prompt that tokenizes differently would not be.
     rng = np.random.default_rng(0)
     prompts = rng.integers(1, 100000, size=(N_REQ, PROMPT_LEN)).tolist()

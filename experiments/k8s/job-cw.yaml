@@ -67,7 +67,6 @@ spec:
         - {name: REPS, value: "${REPS}"}
         - {name: REP0, value: "${REP0}"}
         - {name: A2A, value: "${A2A}"}
-        - {name: SERVE, value: "${SERVE}"}
         - {name: DP, value: "${DP}"}
         - {name: NODES, value: "${NODES}"}
         - {name: HEAD, value: "placement-${NAME}-0.placement-${NAME}.${NS}.svc.cluster.local"}

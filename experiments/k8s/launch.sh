@@ -6,12 +6,11 @@
 #   ./launch.sh NAME=hy  TAG=hy13b MODEL=/models/hy_bf16 TF4=1 BATCH=1
 #   ./launch.sh NAME=gm  TAG=gm26b MODEL=/models/gm_bf16
 #
-# `ARMS=base,base2,6,4,2,base3` switches the job to the real vLLM measurement, one engine load per
-# arm; the offline three-phase run is what you get without it. Adding `SERVE=1 DP=2` runs those
-# arms against a real `vllm serve` on the DeepEP dispatch instead of the offline API, which is
-# the only shape where the volume this kernel shrinks is the volume the engine moves - vLLM's
-# default all-gathers, and 0.31 gates the all-to-all kernels on data parallelism. Give those
-# runs their own TAG (`q30dp`, `q35dp`, `gmdp`); the backend is a measurement condition.
+# `ARMS=base,base2,8,6,6p1,4,4p1,base3` switches the job to the in-engine measurement, one
+# `vllm serve` per arm; without it the job runs the offline paired-NLL pass. `DP=4
+# A2A=deepep_high_throughput` is the only shape where the volume this kernel shrinks is the
+# volume the engine moves - vLLM's default all-gathers, and 0.31 gates the all-to-all kernels
+# on data parallelism. Give those runs their own TAG; the backend is a measurement condition.
 #
 # Add `NODE=<hostname>` to pin a run to one node, which is how you get off a node whose GPU
 # has fallen off the bus - the packing scheduler is deterministic and will keep choosing it.
@@ -33,7 +32,7 @@
 #   KCTL='kubectl --context=waldorf_US-EAST-04A -n almogtavor-dev' TPL=job-cw.yaml \
 #     NS=almogtavor-dev CLAIM=placement-cw BAD=gd91fda ./launch.sh NAME=q30mn TAG=q30mn \
 #     MODEL=/results/models/q30 NODES=4 GPUS=1 DP=1 MEM=200Gi \
-#     SERVE=1 A2A=nixl_ep ARMS=base,base2,4,base3
+#     A2A=nixl_ep ARMS=base,base2,4,base3
 #
 # `nixl_ep`, not `deepep_high_throughput`, at one GPU per node: DeepEP computes `nvl_rank =
 # rank % 8` and `rdma_rank = rank / 8` unconditionally, so its only legal shapes are one node
@@ -54,7 +53,7 @@ set -euo pipefail
 : "${GPU_UTIL:=0.90}"
 : "${BATCH_TOK:=0}"   # 0 = serve_run picks max(MAX_LEN, 2048); vLLM's own DP default is 256
 : "${NODES:=1}" ; : "${BAD:=pokprod-b93r43s1, pokprod-b93r38s0}"
-: "${PENS:=0,1}" ; : "${ARMS:=}" ; : "${SCRIPT:=}" ; : "${IMG:=v0.31.0}" ; : "${A2A:=}" ; : "${SERVE:=0}" ; : "${DP:=2}" ; : "${REPS:=1}" ; : "${REP0:=0}"
+: "${PENS:=0,1}" ; : "${ARMS:=}" ; : "${SCRIPT:=}" ; : "${IMG:=v0.31.0}" ; : "${A2A:=}" ; : "${DP:=2}" ; : "${REPS:=1}" ; : "${REP0:=0}"
 # Which cluster. The defaults are the OpenShift one, whose template carries its namespace and
 # model PVCs as literals; `TPL=job-cw.yaml` is the CoreWeave multi-node shape, which takes
 # both as variables because neither pre-exists there.
@@ -67,7 +66,7 @@ for kv in "$@"; do export "${kv?}"; done
 
 # `nodeSelector: {${NODE}}`, so the pin is a whole `key: value` pair, not just a hostname.
 NODE="${NODE:+kubernetes.io/hostname: ${NODE}}"
-export NAME TAG MODEL GPUS MEM TF4 TFVER BATCH NWIN KEEPS STREAM TOKREF NODE PENS ARMS SCRIPT IMG A2A SERVE DP REPS REP0
+export NAME TAG MODEL GPUS MEM TF4 TFVER BATCH NWIN KEEPS STREAM TOKREF NODE PENS ARMS SCRIPT IMG A2A DP REPS REP0
 export NODES BAD NS CLAIM
 export N_REQ PROMPT_LEN GEN_LEN REPEATS BATCH_TOK GPU_UTIL
 # Internode NVSHMEM knobs, parameterised because which RDMA transport a cluster
@@ -75,6 +74,6 @@ export N_REQ PROMPT_LEN GEN_LEN REPEATS BATCH_TOK GPU_UTIL
 export IBGDA="${IBGDA:-1}" NIC_HANDLER="${NIC_HANDLER:-gpu}" NVSHMEM_DEBUG="${NVSHMEM_DEBUG:-WARN}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ${KCTL} delete job "placement-${NAME}" --ignore-not-found >/dev/null
-envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $PENS $ARMS $SCRIPT $IMG $A2A $SERVE $DP $REPS $REP0 $N_REQ $PROMPT_LEN $GEN_LEN $REPEATS $BATCH_TOK $GPU_UTIL $NODES $BAD $NS $CLAIM $IBGDA $NIC_HANDLER $NVSHMEM_DEBUG' \
+envsubst '$NAME $TAG $MODEL $GPUS $MEM $TF4 $TFVER $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $PENS $ARMS $SCRIPT $IMG $A2A $DP $REPS $REP0 $N_REQ $PROMPT_LEN $GEN_LEN $REPEATS $BATCH_TOK $GPU_UTIL $NODES $BAD $NS $CLAIM $IBGDA $NIC_HANDLER $NVSHMEM_DEBUG' \
   < "${here}/${TPL}" | ${KCTL} apply -f -
-echo "launched placement-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} tf4=${TF4} arms=${ARMS:-offline} a2a=${A2A:-default} serve=${SERVE} dp=${DP} reps=${REPS} rep0=${REP0} shape=${N_REQ}x${PROMPT_LEN}/${GEN_LEN} btok=${BATCH_TOK} nodes=${NODES} ep=$(( GPUS * NODES ))"
+echo "launched placement-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} tf4=${TF4} arms=${ARMS:-offline} a2a=${A2A:-default} dp=${DP} reps=${REPS} rep0=${REP0} shape=${N_REQ}x${PROMPT_LEN}/${GEN_LEN} btok=${BATCH_TOK} nodes=${NODES} ep=$(( GPUS * NODES ))"
