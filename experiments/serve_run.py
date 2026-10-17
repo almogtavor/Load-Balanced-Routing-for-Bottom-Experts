@@ -37,7 +37,7 @@ import numpy as np
 
 MODEL = os.environ["MODEL"]
 TAG = os.environ["TAG"]
-ARM = os.environ.get("ARM", "base")                   # base* | `keep` | `keep`p`load_penalty`
+ARM = os.environ.get("ARM", "base")                   # base* | `keep` | `keep`p`load_penalty`, or keep4-penalty8
 REP = os.environ.get("REP", "0")                      # which sweep; a launch is the unit
 N_GPUS = int(os.environ.get("GPUS", 4))
 DP = int(os.environ.get("DP", 2))
@@ -136,9 +136,11 @@ def throughput(prompts: list[list[int]]) -> list[dict]:
 
 
 def main() -> None:
-    # `4` is keep=4; `4p0.5` is keep=4 with the load penalty. Both in the arm name so a sweep
-    # needs no extra variable to carry them, and one filename still identifies the run.
-    k, _, a = ("", "", "") if ARM.startswith("base") else ARM.partition("p")
+    # `4` is keep=4; `4p0.5` is keep=4 with the load penalty, spelled out `keep4-penalty0.5`. Both
+    # in the arm name so a sweep needs no extra variable to carry them, and one filename still
+    # identifies the run.
+    arm = ARM.replace("keep", "").replace("-penalty", "p")
+    k, _, a = ("", "", "") if ARM.startswith("base") else arm.partition("p")
     keep = None if k == "" else int(k)
     load_penalty = float(a) if a else 0.0
     if keep is None:
