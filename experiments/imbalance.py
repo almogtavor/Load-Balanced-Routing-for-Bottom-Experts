@@ -56,6 +56,7 @@ _acc: dict[tuple, torch.Tensor] = {}
 _calls = 0
 _seen = 0
 _declined: dict[str, int] = {}
+_tokens: list[int] = []  # real rows per measured call: says whether a run saw prefill or decode
 _dumped = False
 
 
@@ -115,6 +116,7 @@ def probe(logits, topk_ids, k) -> None:
     fl = logits.float()
     full = torch.where(live[:, None], ids, fl.topk(k, -1).indices.to(ids.dtype))
     _calls += 1
+    _tokens.append(int(live.sum()))
     for g, keep, pen, tile in _grid(k):
         if e % g or e // g < k:
             _decline(f"{e} experts over {g} ranks leaves no substitutes")
@@ -145,7 +147,8 @@ def dump() -> None:
               f" - the hook did not reach the router", flush=True)
         return
     out = {k: (v / _calls).tolist() for k, v in _acc.items()}
-    print(f"[imb] calls={_calls} seen={_seen} declined={_declined}", flush=True)
+    print(f"[imb] calls={_calls} seen={_seen} declined={_declined} tokens per call: "
+          f"min {min(_tokens)} median {sorted(_tokens)[len(_tokens) // 2]} max {max(_tokens)}", flush=True)
     print(f"[imb] {'arm':<22}{'vol ↓':>10}{'busiest rank recv ↓':>22}{'busiest rank work ↓':>22}"
           f"{'busiest expert ↓':>19}{'calls lighter ↑':>18}", flush=True)
     for g in EPS:
@@ -166,7 +169,7 @@ def dump() -> None:
                   flush=True)
     p = pathlib.Path("runs") / f"imbalance_{TAG}_{rank}.json"
     p.parent.mkdir(exist_ok=True)
-    p.write_text(json.dumps({"calls": _calls, "eps": EPS,
+    p.write_text(json.dumps({"calls": _calls, "eps": EPS, "tokens": _tokens,
                              "arms": {f"{g}/{keep}/{pen:g}/{tile}": v for (g, keep, pen, tile), v
                                       in out.items()}}, indent=1))
     print(f"[imb] wrote {p}", flush=True)

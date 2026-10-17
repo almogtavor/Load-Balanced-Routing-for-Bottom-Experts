@@ -24,6 +24,8 @@ pile-up; on Qwen3-30B's logits at `load_penalty=1` it left the busiest rank 3-32
 default vLLM at `keep <= 4`. At `block_t=16` and `load_penalty=8`, decoding 256 sequences of text
 at EP 4-16, the busiest rank does 15-24% less expert work than under default vLLM at keep 6 and 4,
 in at least 99.8% of calls; at keep 2 only 4-9% less, and in 60-88% of calls.
+In prefill forwards of 16384 tokens of the same text it is 14-21% less at keep 6 and 4, in at least
+97% of calls, and at keep 2 between 5% less and 2% more.
 
 None of this touches traffic. At any price the tail stays on the head's ranks, so each rank
 receives exactly what `keep` alone sends it, never more than under the default top-k. The counts
