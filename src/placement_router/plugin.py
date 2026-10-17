@@ -1,4 +1,4 @@
-"""Installing the placement-aware router into a stock vLLM, in place.
+"""Installing the placement-aware router into default vLLM, in place.
 
 vLLM v0.31 routes through a small class hierarchy: `BaseRouter._select_experts` validates the
 EPLB state, delegates to a subclass `_compute_routing`, maps logical expert ids to physical
@@ -7,7 +7,7 @@ ones and fixes the index dtype. Every fused-MoE layer in the engine goes through
 Nearly every MoE model served by vLLM routes through `FusedTopKRouter`, and for those this
 plugin swaps in `placement_router.vendor.fused_topk_router` - that same unit copied in with a four-line
 insert, where the kernel *replaces* the fused top-k rather than running after it. One Triton
-launch per MoE layer, exactly where stock vLLM also spends one, so nothing is added to the
+launch per MoE layer, exactly where default vLLM also spends one, so nothing is added to the
 forward and `keep == top_k` is a control arm that costs nothing measurable.
 
 `Gemma4Router` is the exception. It routes through `CustomRoutingRouter`, whose routing
@@ -93,7 +93,7 @@ def keep_for(router, router_logits) -> int | None:
             k = None
         else:
             # At warning level on purpose: this is the one line that says the kernel is
-            # actually running, and `logger.info` is below the root logger's level in a stock
+            # actually running, and `logger.info` is below the root logger's level in a default
             # vLLM image, so an info-level version of it is invisible exactly where it matters.
             _once("active", "placement-router: placement-aware routing active, keep=%d of top_k=%d, "
                             "ep_size=%d" % (k, router.top_k, ep_size()), warn=True)
@@ -102,11 +102,12 @@ def keep_for(router, router_logits) -> int | None:
 
 
 def load_penalty() -> float:
-    """`PLACEMENT_LOAD_PENALTY`: the load penalty charged per slot already placed on a tail pick's rank.
+    """`PLACEMENT_LOAD_PENALTY`: what a tail pick pays per pick already on its rank, per token of its tile.
 
     0.0 is the plain rule - minimise summed volume. Anything higher trades none of that volume
     (the tail stays confined to the head's ranks either way) for a flatter spread over them,
-    which is what the step actually waits on. See the kernel docstring.
+    which is what the step actually waits on. The count is over a tile of the batch, not one
+    token. See the kernel docstring.
     """
     return _LOAD_PENALTY
 
@@ -157,7 +158,7 @@ def _gemma_compute_routing(inner):
 
     No padding mask, unlike the `FusedTopKRouter` path: Gemma's own routing kernel carries
     none and routes padding tokens like any other, so dropping them here would credit this arm
-    with dispatch volume the stock engine pays.
+    with dispatch volume default vLLM pays.
     """
 
     def _compute_routing(self, hidden_states, router_logits, indices_type, *, input_ids=None):

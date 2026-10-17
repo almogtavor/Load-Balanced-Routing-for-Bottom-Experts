@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Dispatch fan-out and load, measured on the real router's logits inside a running engine.
 
-Stock routing decides the forward: `PLACEMENT_KEEP` stays unset, so the plugin patches nothing
+Default vLLM routing decides the forward: `PLACEMENT_KEEP` stays unset, so the plugin patches nothing
 and the engine serves exactly what it would without this file. The probe only *reads* each
 router call's logits and scores every arm on them, so one engine load produces the whole
-`(ep, keep, load_penalty)` grid on identical inputs - a paired comparison with no run-to-run
+`(ep, keep, load_penalty, tile)` grid on identical inputs - a paired comparison with no run-to-run
 variance between arms at all.
 
 The expert-to-rank map is `e * G // E`, arithmetic on the expert id alone, so the grid can
@@ -16,9 +16,11 @@ Four numbers per arm:
 
 * `vol`  - summed (token, rank) dispatch pairs. What the rule is built to cut.
 * `disp` - dispatch pairs landing on the busiest rank. The all-to-all's tail.
-* `work` - expert slots on the busiest rank, over the mean. Every rank waits for the slowest.
-* `exp`  - slots on the busiest *expert*, over the mean. Total slots are fixed, so this is
+* `work` - expert assignments on the busiest rank, over the mean. Every rank waits for the slowest.
+* `exp`  - assignments on the busiest *expert*, over the mean. Their total is fixed, so this is
   the grouped GEMM's own tail: identical work spread over a longer per-expert block is slower.
+* `lighter` - the share of calls whose busiest rank does less work than default vLLM's on the
+  same call. A mean can hide a minority of calls the rule made worse.
 
 Run through `run.sh` with `PLACEMENT_PROBE` pointing here; `plugin.register()` loads it inside
 every worker, which is the only place the patch can reach the model.
@@ -43,8 +45,9 @@ def _floats(name, default):
 
 
 EPS = _ints("EPS", "4,8,16")              # ep sizes to report for, independent of GPU count
-KEEPS = _ints("IMB_KEEPS", "6,4,2")       # substitution budgets; stock is added per ep
+KEEPS = _ints("IMB_KEEPS", "6,4,2")       # substitution budgets; default vLLM is added per ep
 PENS = _floats("PENS", "0,1")             # load_penalty values per keep
+TILES = _ints("TILES", "1,16")            # load-balancing tiles per nonzero load_penalty
 CALLS = int(os.environ.get("CALLS", 240))  # router calls to score, then dump and go quiet
 TAG = os.environ.get("TAG", "imb")
 WARMUP = int(os.environ.get("WARMUP", 480))  # router calls to discard before measuring
@@ -76,12 +79,12 @@ def _decline(why: str) -> None:
 
 
 def _grid(k):
-    """`(ep, keep, load_penalty)` arms. Stock (`keep == k`) once per ep as that ep's baseline."""
+    """`(ep, keep, load_penalty, tile)` arms. Default vLLM (`keep == k`) once per ep as its baseline."""
     for g in EPS:
-        yield g, k, 0.0
-        for keep, pen in itertools.product(KEEPS, PENS):
-            if keep < k:
-                yield g, keep, pen
+        yield g, k, 0.0, 1
+        for keep, pen, tile in itertools.product(KEEPS, PENS, TILES):
+            if keep < k and (pen or tile == 1):
+                yield g, keep, pen, tile
 
 
 def probe(logits, topk_ids, k) -> None:
@@ -102,23 +105,27 @@ def probe(logits, topk_ids, k) -> None:
     if _seen <= WARMUP:
         return
     e = logits.shape[-1]
-    # vLLM pads unused slots with -1, which under an unsigned index dtype reads as 4294967295;
-    # either way such a row would be indexed out of bounds below, so drop the row.
+    # vLLM sets a padding row's expert ids to -1, which under an unsigned index dtype reads as
+    # 4294967295; either way such a row would be indexed out of bounds below, so it is scored
+    # out. It stays in the batch the rewrite sees, as it does in the kernel, so the tiles match.
     ids = topk_ids.view(torch.int32) if topk_ids.dtype == torch.uint32 else topk_ids
     live = (ids >= 0).all(1)
     if not bool(live.any()):
         return _decline("every row padded")
-    logits, ids = logits[live], ids[live]
     fl = logits.float()
+    full = torch.where(live[:, None], ids, fl.topk(k, -1).indices.to(ids.dtype))
     _calls += 1
-    for g, keep, pen in _grid(k):
+    for g, keep, pen, tile in _grid(k):
         if e % g or e // g < k:
             _decline(f"{e} experts over {g} ranks leaves no substitutes")
             continue
-        sel = ids if keep >= k else rewrite_torch(fl, ids, keep, g, pen)
+        sel = ids[live] if keep >= k else rewrite_torch(fl, full, keep, g, pen, tile, ~live)[live]
         w, d, x = _hist(sel, e, g)
-        row = torch.stack([d.sum(), d.max(), w.max() / w.mean(), x.max() / x.mean(), w.sum()])
-        key = (g, keep, pen)
+        if keep >= k:
+            top = w.max()                                              # `_grid` yields it first
+        row = torch.stack([d.sum(), d.max(), w.max() / w.mean(), x.max() / x.mean(), w.sum(),
+                           (w.max() < top).double()])
+        key = (g, keep, pen, tile)
         _acc[key] = row if key not in _acc else _acc[key] + row
     if _calls == CALLS:
         dump()
@@ -139,26 +146,28 @@ def dump() -> None:
         return
     out = {k: (v / _calls).tolist() for k, v in _acc.items()}
     print(f"[imb] calls={_calls} seen={_seen} declined={_declined}", flush=True)
-    print(f"[imb] {'arm':<14}{'vol':>10}{'busiest rank recv':>20}{'busiest rank work':>20}"
-          f"{'busiest expert':>17}", flush=True)
+    print(f"[imb] {'arm':<22}{'vol ↓':>10}{'busiest rank recv ↓':>22}{'busiest rank work ↓':>22}"
+          f"{'busiest expert ↓':>19}{'calls lighter ↑':>18}", flush=True)
     for g in EPS:
-        if (g, _k0(), 0.0) not in out:
+        if (g, _k0(), 0.0, 1) not in out:
             continue
-        base = out[(g, _k0(), 0.0)]
-        for (gg, keep, pen), (vol, dmax, work, xmax, wk) in out.items():
+        base = out[(g, _k0(), 0.0, 1)]
+        for (gg, keep, pen, tile), (vol, dmax, work, xmax, wk, lighter) in out.items():
             if gg != g:
                 continue
-            # Total expert slots is `rows * top_k` in every arm by construction. If it moved,
-            # the rule dropped or duplicated a slot and every ratio here measures that instead.
-            assert abs(wk / base[4] - 1) < 1e-9, f"{(gg, keep, pen)} moved work {wk}"
-            name = "stock" if keep >= _k0() else f"keep={keep} pen={pen:g}"
-            print(f"[imb] ep={g:<3} {name:<16}"
-                  f"{vol / base[0] - 1:>+9.2%}{dmax / base[1] - 1:>+19.2%}"
-                  f"{work / base[2] - 1:>+19.2%}{xmax / base[3] - 1:>+16.2%}", flush=True)
+            # Total expert assignments are `rows * top_k` in every arm by construction. If it
+            # moved, the rule dropped or duplicated one and every ratio here measures that instead.
+            assert abs(wk / base[4] - 1) < 1e-9, f"{(gg, keep, pen, tile)} moved work {wk}"
+            name = ("default vLLM" if keep >= _k0() else
+                    f"keep={keep} pen={pen:g}" + (f" tile={tile}" if pen else ""))
+            print(f"[imb] ep={g:<3} {name:<24}"
+                  f"{vol / base[0] - 1:>+9.2%}{dmax / base[1] - 1:>+21.2%}"
+                  f"{work / base[2] - 1:>+21.2%}{xmax / base[3] - 1:>+18.2%}{lighter:>17.1%}",
+                  flush=True)
     p = pathlib.Path("runs") / f"imbalance_{TAG}_{rank}.json"
     p.parent.mkdir(exist_ok=True)
     p.write_text(json.dumps({"calls": _calls, "eps": EPS,
-                             "arms": {f"{g}/{keep}/{pen:g}": v for (g, keep, pen), v
+                             "arms": {f"{g}/{keep}/{pen:g}/{tile}": v for (g, keep, pen, tile), v
                                       in out.items()}}, indent=1))
     print(f"[imb] wrote {p}", flush=True)
 
@@ -171,7 +180,7 @@ def _k0():
 
 
 def install() -> None:
-    """Wrap the stock routing units read-only. Loaded by `plugin.register()` inside each
+    """Wrap the default routing units read-only. Loaded by `plugin.register()` inside each
     worker; patching from the driver process would never reach the model."""
     from vllm.model_executor.layers.fused_moe.router.custom_routing_router import (
         CustomRoutingRouter)
@@ -214,12 +223,12 @@ def install() -> None:
         return out
 
     FusedTopKRouter._compute_routing = _compute_routing
-    print(f"[imb] probe installed, eps={EPS} keeps={KEEPS} pens={PENS} calls={CALLS} "
+    print(f"[imb] probe installed, eps={EPS} keeps={KEEPS} pens={PENS} tiles={TILES} calls={CALLS} "
           f"warmup={WARMUP}", flush=True)
 
 
 def main() -> None:
-    """Load an engine under stock routing and generate until the probe has its calls."""
+    """Load an engine under default vLLM routing and generate until the probe has its calls."""
     from vllm import LLM, SamplingParams
 
     os.environ.pop("PLACEMENT_KEEP", None)
@@ -237,7 +246,12 @@ def main() -> None:
               gpu_memory_utilization=float(os.environ.get("GPU_UTIL", 0.85)))
     g = torch.Generator().manual_seed(0)
     vocab = llm.get_tokenizer().vocab_size
-    toks = torch.randint(0, vocab, (n_req, prompt_len), generator=g).tolist()
+    # Real text when given: random ids route unlike text. ponytail: the cached streams on the
+    # results volume are Qwen3 token ids, so this is Qwen3 only.
+    stream = os.environ.get("IMB_STREAM")
+    toks = (torch.from_numpy(__import__("numpy").load(stream)[: n_req * prompt_len].astype("int64"))
+            .view(n_req, prompt_len).tolist() if stream
+            else torch.randint(0, vocab, (n_req, prompt_len), generator=g).tolist())
     llm.generate([{"prompt_token_ids": t} for t in toks],
                  SamplingParams(max_tokens=int(os.environ.get("GEN_LEN", 8)),
                                 temperature=0.0))
