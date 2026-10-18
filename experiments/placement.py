@@ -31,8 +31,19 @@ test's resolution rather than against a literal zero.
 from __future__ import annotations
 
 import math
+import pathlib
+import sys
 
 import torch
+
+# Offline accuracy can run directly from a checkout, before the vLLM plugin is installed.
+try:
+    from placement_router.kernel import rewrite_torch, select
+except ModuleNotFoundError as exc:
+    if exc.name not in ("placement_router", "placement_router.kernel"):
+        raise
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
+    from placement_router.kernel import rewrite_torch, select
 
 __all__ = ["allowed_mask", "fanout", "gpu_of", "mask_logits", "random_mask"]
 
@@ -50,23 +61,28 @@ def gpu_of(n_experts: int, n_gpus: int, device=None) -> torch.Tensor:
 
 
 def allowed_mask(logits: torch.Tensor, keep: int, gpu: torch.Tensor, n_gpus: int,
-                 top_k: int) -> torch.Tensor:
-    """`[T, E]` bool: the top-`keep`, plus the best substitutes already-visited GPUs offer.
+                 top_k: int, load_penalty: float = 0.0,
+                 base_ids: torch.Tensor | None = None) -> torch.Tensor:
+    """Exactly the production reference's selected set, expressed as a `[T, E]` mask.
 
-    Exactly `top_k` experts, so the gate cannot deviate from this selection. A GPU block holds
-    `E / G >= top_k` experts and at most `keep` of them are head, so there are always enough
-    substitutes to fill the remaining slots.
+    `logits` must be raw logits (or log-probabilities, which differ only by a row
+    constant). Subtracting a load penalty from probabilities would change the rule.
+    The contiguous expert-to-rank placement is shared with the serving kernel.
+    `base_ids` preserves the original router's tie-breaking when it returns indices.
     """
-    head = logits.topk(keep, dim=-1).indices                       # [T, keep]
-    hot = torch.zeros(logits.shape[0], n_gpus, dtype=torch.bool, device=logits.device)
-    hot.scatter_(1, gpu[head], torch.ones_like(head, dtype=torch.bool))
-    m = torch.zeros_like(logits, dtype=torch.bool)
-    m.scatter_(1, head, torch.ones_like(head, dtype=torch.bool))
-    if top_k > keep:
-        # Highest logits among experts that are on a hot GPU and not already in the head.
-        sub = mask_logits(logits, hot[:, gpu] & ~m).topk(top_k - keep, dim=-1).indices
-        m.scatter_(1, sub, torch.ones_like(sub, dtype=torch.bool))
-    return m                                                       # [T, E]
+    if not 1 <= keep <= top_k <= logits.shape[-1]:
+        raise ValueError(f"require 1 <= keep <= top_k <= E, got {keep}, {top_k}")
+    if logits.shape[-1] % n_gpus or logits.shape[-1] // n_gpus < top_k:
+        raise ValueError("each contiguous rank block must hold at least top_k experts")
+    if gpu.numel() != logits.shape[-1]:
+        raise ValueError("expert-to-rank map has the wrong size")
+    if not math.isfinite(load_penalty) or load_penalty < 0:
+        raise ValueError("load_penalty must be finite and nonnegative")
+    base = logits.topk(top_k, dim=-1).indices if base_ids is None else base_ids
+    ids = rewrite_torch(logits.float(), base, keep, n_gpus, load_penalty)
+    mask = torch.zeros_like(logits, dtype=torch.bool)
+    mask.scatter_(1, ids.long(), True)
+    return mask
 
 
 def random_mask(logits: torch.Tensor, keep: int, top_k: int,

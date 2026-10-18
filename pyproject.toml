@@ -9,8 +9,17 @@ description = "Placement-aware router for the bottom experts of a top-k MoE, as 
 requires-python = ">=3.10"
 dependencies = ["torch"]
 
+[project.optional-dependencies]
+test = ["pytest>=8", "numpy", "transformers>=4.51"]
+quality = ["numpy", "transformers>=4.51", "accelerate", "datasets"]
+
 [project.entry-points."vllm.general_plugins"]
 placement_aware_router = "placement_router.plugin:register"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "experiments"]
+addopts = "--import-mode=importlib"

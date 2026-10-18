@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "placement-stochastic-tail-experiment"
+version = "0.0.1"
+description = "Isolated, source-pinned experimental stochastic MoE tail"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.entry-points."vllm.general_plugins"]
+stochastic_tail_experiment = "stochastic_tail.plugin:register"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["stochastic_tail*"]

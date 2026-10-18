@@ -9,3 +9,12 @@ runs/*
 __pycache__/
 .env
 .DS_Store
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+/output/
+/tmp/
+*.pyc

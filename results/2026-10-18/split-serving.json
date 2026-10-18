@@ -1,0 +1,168 @@
+{
+  "administrative_attempt_qualification": {
+    "path": "audit/hybrid-administrative-attempt-qualification-v1.json",
+    "sha256": "23aff98dc5ac94560ea4c7c4626c055fe1b474c8b6d8369546797ca4b3c673c2"
+  },
+  "archive_sha256": "fbb5a3915c8f0d74fae39a51668e3563e78bf2ee280f4ce228547534b41732e7",
+  "complete": true,
+  "effects": {
+    "keep4p8_vs_stock": {
+      "batch_time_change_percent": -0.6268227787714982,
+      "batch_time_nominal_pointwise_95ci_percent": [
+        -5.907527085477496,
+        4.9502478270772166
+      ],
+      "df": 2,
+      "interpretation": "Descriptive small-n nominal paired log-t interval; three fresh sweep units on one host, no equivalence or SLO guarantee",
+      "mean_log_rate_ratio": 0.006287955609709073,
+      "paired_sweeps": 3,
+      "raw_log_rate_ratios": [
+        0.024210189127253923,
+        0.012891723929693288,
+        -0.018238046227819993
+      ],
+      "raw_rate_ratios": [
+        1.0245056352064803,
+        1.0129751804498253,
+        0.9819272604547998
+      ],
+      "sample_sd_log_rate_ratio": 0.021981139374653832,
+      "throughput_change_percent": 0.6307766303738487,
+      "throughput_nominal_pointwise_95ci_percent": [
+        -4.71675668192186,
+        6.278426852320204
+      ]
+    },
+    "keep6p8_vs_stock": {
+      "batch_time_change_percent": -0.32323868514763915,
+      "batch_time_nominal_pointwise_95ci_percent": [
+        -4.214056068609021,
+        3.7256233893206883
+      ],
+      "df": 2,
+      "interpretation": "Descriptive small-n nominal paired log-t interval; three fresh sweep units on one host, no equivalence or SLO guarantee",
+      "mean_log_rate_ratio": 0.003237622298893683,
+      "paired_sweeps": 3,
+      "raw_log_rate_ratios": [
+        0.014934104782820423,
+        -0.01503245529305719,
+        0.009811217406917816
+      ],
+      "raw_rate_ratios": [
+        1.0150461757237175,
+        0.9850799680251949,
+        1.0098595051918722
+      ],
+      "sample_sd_log_rate_ratio": 0.016028343494524772,
+      "throughput_change_percent": 0.32428690587830616,
+      "throughput_nominal_pointwise_95ci_percent": [
+        -3.591806216808208,
+        4.399451418078045
+      ]
+    }
+  },
+  "interpretation": "No demonstrated end-to-end throughput gain in this fixed workload: both nominal pointwise95% intervals include zero. Finite-corpus GSM differences are conditional on stock NIXL handoff and stock decode; no monolithic-equivalence or accuracy-safety claim.",
+  "paired_sweep_mean_batch_seconds": {
+    "0": {
+      "keep4p8": 33.93360065933333,
+      "keep6p8": 34.249836046666665,
+      "stock": 34.765165098333334
+    },
+    "1": {
+      "keep4p8": 33.764839830999996,
+      "keep6p8": 34.720982895666666,
+      "stock": 34.202944720666665
+    },
+    "2": {
+      "keep4p8": 34.658385821,
+      "keep6p8": 33.69975097133334,
+      "stock": 34.032013841
+    }
+  },
+  "qualifications": [
+    "All timing contrasts use fresh stock-prefill/stock-decode handoff on this allocation, with stock decode in every arm.",
+    "Three paired sweep units on one H200 host; inherited timing t intervals have two degrees of freedom and are descriptive.",
+    "One fresh full1319 GSM8K server pair per arm; item counts and percentage-point differences are finite-corpus observations, without a launch-population confidence interval.",
+    "No pooling with old partial V6, public monolithic quality or H100 prefill results; failed V5 output-equivalence remains failed.",
+    "No monolithic numerical equivalence, monolithic accuracy safety, SLO or clean-run KV tensor-integrity claim.",
+    "Native phase proof and off-clock timed transfer-count/byte coverage have distinct observer scopes; synchronized KV checks do not rule out an uninstrumented visibility race.",
+    "All raw rounds, errors, length caps, empty outputs and parsing failures are retained by the unchanged frozen readers."
+  ],
+  "quality": {
+    "keep4p8": {
+      "accuracy_percent": 95.22365428354814,
+      "correct": 1256,
+      "empty": 0,
+      "length_finished": 5,
+      "n": 1319,
+      "parse_failed": 0,
+      "strict_accuracy_percent": 88.47611827141775,
+      "strict_correct": 1167
+    },
+    "keep6p8": {
+      "accuracy_percent": 95.75435936315391,
+      "correct": 1263,
+      "empty": 0,
+      "length_finished": 8,
+      "n": 1319,
+      "parse_failed": 0,
+      "strict_accuracy_percent": 89.23426838514025,
+      "strict_correct": 1177
+    },
+    "stock": {
+      "accuracy_percent": 95.67854435178165,
+      "correct": 1262,
+      "empty": 0,
+      "length_finished": 6,
+      "n": 1319,
+      "parse_failed": 0,
+      "strict_accuracy_percent": 89.08263836239576,
+      "strict_correct": 1175
+    }
+  },
+  "quality_paired_contrasts": {
+    "keep4p8": {
+      "correct": {
+        "accuracy_difference_pp": -0.45489006823351025,
+        "paired_gain_items": 13,
+        "paired_loss_items": 19,
+        "stock_handoff_correct": 1262,
+        "treatment_correct": 1256
+      },
+      "strict_correct": {
+        "accuracy_difference_pp": -0.6065200909780136,
+        "paired_gain_items": 41,
+        "paired_loss_items": 49,
+        "stock_handoff_correct": 1175,
+        "treatment_correct": 1167
+      }
+    },
+    "keep6p8": {
+      "correct": {
+        "accuracy_difference_pp": 0.0758150113722517,
+        "paired_gain_items": 8,
+        "paired_loss_items": 7,
+        "stock_handoff_correct": 1262,
+        "treatment_correct": 1263
+      },
+      "strict_correct": {
+        "accuracy_difference_pp": 0.1516300227445034,
+        "paired_gain_items": 34,
+        "paired_loss_items": 32,
+        "stock_handoff_correct": 1175,
+        "treatment_correct": 1177
+      }
+    }
+  },
+  "quality_requests": 3957,
+  "raw_acceptance": {
+    "path": "audit/hybrid-complete-raw-analysis-v2.json",
+    "sha256": "65ff53c3fea2d89e437b9ae2e2a3a895c53c3f07fe8320bb8ac42bd829e556ca"
+  },
+  "release_receipt_sha256": "eeea3bd03198f93caccb2d01ef5e8c93b11a8939f63352e97d52938d5b048780",
+  "schema": "fresh-hybrid-qualified-results-v1",
+  "source_plan_sha256": "2e9e5b7f03946381a8d59fbd80535ef5b29d5d63b1520e985ce2df3dc1c1f4b5",
+  "timing_integrity": "PASS complete9pairs,54cohorts,13824logicalrequests; every producerJSON/consumerSSE independently rescored",
+  "verified_native_phase_pairs": 6,
+  "verified_timed_pairs": 9
+}
