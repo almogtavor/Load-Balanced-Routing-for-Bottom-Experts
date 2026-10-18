@@ -49,6 +49,8 @@ per tile of tokens with no `[T, E]` temporary, and is the one that runs under vL
 
 from __future__ import annotations
 
+import logging
+import os
 import sys
 
 import torch
@@ -58,6 +60,19 @@ try:
     import triton.language as tl
 except ImportError:                                                    # CPU-only dev boxes
     triton = None
+
+# Read once before serving starts; unset/baseline retains the original selector.
+_SELECTOR_ENV = os.environ.get("PLACEMENT_EXPERIMENTAL_SELECTOR", "")
+_EXPERIMENTAL_SELECTOR = _SELECTOR_ENV.strip().lower() or "baseline"
+_EXPERIMENTAL_IMPL = None
+if _EXPERIMENTAL_SELECTOR != "baseline":
+    from placement_router.experimental import configured_selector
+    _EXPERIMENTAL_IMPL = configured_selector(_EXPERIMENTAL_SELECTOR)
+if _SELECTOR_ENV:
+    # Stock vLLM can filter third-party INFO logs; identity must be visible in
+    # captured server logs just like the plugin's existing keep/penalty message.
+    logging.getLogger(__name__).warning("placement-router: experimental selector=%s", _EXPERIMENTAL_SELECTOR)
+
 
 __all__ = ["select", "rewrite_torch", "gate_weights", "expected_fanout"]
 
@@ -240,6 +255,9 @@ def select(logits: torch.Tensor, k: int, keep: int, n_ranks: int,
     constexprs compile the load away. `block_t` is the load-balancing tile, a power of two; without
     a `load_penalty` there is nothing to share and each program takes one token, as before.
     """
+    if _EXPERIMENTAL_IMPL is not None and triton is not None and logits.is_cuda:
+        return _EXPERIMENTAL_IMPL(logits, k, keep, n_ranks, is_padding, scale,
+                                  indices_dtype, load_penalty)
     if triton is not None and logits.is_cuda:
         logits = logits.contiguous()
         t, e = logits.shape

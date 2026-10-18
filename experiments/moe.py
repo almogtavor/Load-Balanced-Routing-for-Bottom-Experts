@@ -1,33 +1,20 @@
-"""Finding and overriding a MoE router, across three families that agree on nothing.
+"""Teacher-forced MoE quality hooks for Qwen and Gemma router contracts.
 
-`accuracy.py` scores perplexity with every router's top-k forced to the set `placement.py` chose.
+The baseline leaves native router outputs untouched. Placement selection reuses the
+production selector (Triton on CUDA), including its per-rank load penalty and gate
+weights from the original unpenalized distribution. Gemma returns probabilities
+rather than raw logits; a child hook captures its native projection for the
+penalty (log-probabilities are a fallback); its per-expert factors follow the selected experts.
 
-The families differ in three ways that each need handling:
-
-* **where the config lives.** Qwen3.5 and Gemma 4 ship as multimodal wrappers whose
-  `text_config` carries the routing; Qwen3-30B keeps it at the top level.
-* **what the router module is.** Transformers 5 made Qwen's a `*TopKRouter` holding a bare `nn.Parameter` and
-  returning `(logits, scores, indices)`; Gemma 4's `Gemma4TextRouter` returns
-  `(probs, weights, indices)` and does its projection in a child `nn.Linear` (`router.proj`).
-  The child is the tempting hook - it puts the whole top-k downstream, so the plain-logits path
-  appears to cover it - and it is the wrong one: Gemma's own `softmax -> topk -> /= sum ->
-  * per_expert_scale` chain then runs on *masked* scores and reaches the same answer by a
-  different sequence of divisions, which in bf16 left the no-op arm 0.02 nat off the baseline.
-  So the parent is hooked and its tuple rebuilt here, exactly as the Qwen routers are.
-* **what happens after the projection.** Every family softmaxes, takes top-k and renormalizes
-  by the top-k sum. The renormalization is what makes logit masking exact rather than
-  approximate: masking changes the softmax denominator, and dividing by the top-k sum divides
-  that change straight back out - in exact arithmetic. It cancels to rounding in floating
-  point, so on the families whose softmax is downstream of this hook the no-op arm lands a
-  fraction of a millinat off zero rather than on it; `accuracy.py` bounds that rather than
-  demanding a zero it cannot have. Gemma's extra `per_expert_scale` is gathered at the chosen
-  indices, so it follows the selection rather than being perturbed by the mask.
-
-Every family that returns its selection needs it rebuilt here, because masked logits cannot
-reach it otherwise: that is the transformers-5 Qwen routers and Gemma 4's.
+Routers returning `(logits/probs, weights, ids)` have only their selected weights and
+ids replaced. Older plain-logit routers receive an exact-width mask and execute their
+native top-k downstream. No-op and repeat baselines validate both contracts.
 """
 
 from __future__ import annotations
+
+from contextlib import nullcontext
+import math
 
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -106,12 +93,25 @@ def routers(model, n_experts: int, hidden: int) -> list[torch.nn.Module]:
     return out
 
 
+def _select_on_device(logits, *args, **kwargs):
+    """Launch Triton on the layer's device under HF device_map="auto".
+
+    Tensor operations infer their device from their inputs; a Triton launch uses the
+    current CUDA device/stream. Accelerate may call a later layer with CUDA 0 still
+    current while its logits live on CUDA 1, so enter the logits' device explicitly.
+    """
+    context = torch.cuda.device(logits.device) if logits.is_cuda else nullcontext()
+    with context:
+        return P.select(logits, *args, **kwargs)
+
+
 def install(model, n_experts: int, top_k: int, hidden: int, n_gpus: int,
-            trace_tokens: int = 0):
+            trace_tokens: int = 0, parity_tokens: int = 0):
     """Hook every router. Returns `(state, handles)`; mutate `state` to switch arm.
 
     `state["arm"]` is one of `baseline` / `placement` / `random` and `state["keep"]` is how many
-    top ranks are chosen by score; `placement` at `keep == top_k` is the no-op arm. `changed`
+    top ranks are chosen by score. `state["load_penalty"]` is charged per slot already on
+    a rank; `placement` at `keep == top_k` and penalty 0 is the no-op arm. `changed`
     and `rows` accumulate the fired fraction, and `trace`, when a dict, collects up to
     `trace_tokens` of routing per layer for the fan-out count.
     """
@@ -121,79 +121,148 @@ def install(model, n_experts: int, top_k: int, hidden: int, n_gpus: int,
     # Per-device block map: `device_map="auto"` spreads layers over GPUs, so the logits of
     # different layers arrive on different devices.
     gpu_maps: dict[torch.device, torch.Tensor] = {}
-    state: dict = {"arm": "baseline", "keep": 0, "trace": None, "changed": 0, "rows": 0,
+    state: dict = {"arm": "baseline", "keep": 0, "load_penalty": 0.0,
+                   "trace": None, "parity": {}, "raw_sources": {}, "changed": 0, "rows": 0,
                    "n_routers": len(gates)}
     order = {id(g): i for i, g in enumerate(gates)}
+    projection_logits = {}
+    projection_handles = []
+    for gate in gates:
+        if getattr(gate, "per_expert_scale", None) is not None and hasattr(gate, "proj"):
+            def remember_projection(mod, args, out, router_id=id(gate)):
+                projection_logits[router_id] = out
+            projection_handles.append(gate.proj.register_forward_hook(remember_projection))
 
     def hook(mod, args, out):
-        logits = out[0] if isinstance(out, tuple) else out
-        z = logits.reshape(-1, logits.shape[-1])
+        scores = out[0] if isinstance(out, tuple) else out
+        z = scores.reshape(-1, scores.shape[-1])
+        scale = getattr(mod, "per_expert_scale", None)
+        # Gemma returns probabilities. Prefer its captured native projection logits,
+        # exactly what serving uses. log(p) is a fallback up to a row constant;
+        # subtracting a penalty directly from probabilities would change the rule.
+        projected = projection_logits.pop(id(mod), None)
+        if projected is not None:
+            raw = projected.reshape(-1, projected.shape[-1]).float()
+            state["raw_sources"][order[id(mod)]] = "native_projection_logits"
+        elif scale is not None:
+            raw = z.float().clamp_min(torch.finfo(torch.float32).tiny).log()
+            state["raw_sources"][order[id(mod)]] = "log_native_probabilities"
+        else:
+            raw = z.float()
+            state["raw_sources"][order[id(mod)]] = "native_router_logits"
+        base = out[2].reshape(-1, top_k).long() if isinstance(out, tuple) else z.topk(top_k, -1).indices
         gpu = gpu_maps.setdefault(z.device, P.gpu_of(n_experts, n_gpus, z.device))
         arm, keep = state["arm"], state["keep"]
+        penalty = float(state.get("load_penalty", 0.0))
+        production_val = None
         if arm == "baseline":
-            m = None
-        elif arm == "random":
-            m = P.random_mask(z, keep, top_k)
-        else:  # placement, and the no-op arm which is placement at keep == top_k
-            m = P.allowed_mask(z, keep, gpu, n_gpus, top_k)
-        z2 = z if m is None else P.mask_logits(z, m)
-
-        idx = z2.topk(top_k, -1).indices
-        if m is not None:
-            base = z.topk(top_k, -1).indices
+            mask = None
+            idx = base
+        else:
+            if arm == "random":
+                mask = P.random_mask(raw, keep, top_k)
+            elif arm in ("placement", "production_noop"):
+                if keep < top_k or arm == "production_noop":
+                    if not getattr(mod, "norm_topk_prob", True):
+                        raise ValueError("production placement requires normalized top-k weights")
+                    production_val, ids = _select_on_device(raw, top_k, keep, n_gpus, scale=scale,
+                                                   load_penalty=penalty)
+                    mask = torch.zeros_like(raw, dtype=torch.bool).scatter_(1, ids.long(), True)
+                else:
+                    # No-op tests native selection and weight arithmetic separately.
+                    mask = P.allowed_mask(raw, keep, gpu, n_gpus, top_k, penalty, base)
+            else:
+                raise ValueError(f"unknown routing arm {arm!r}")
+            idx = (P.mask_logits(raw, mask).topk(top_k, -1).indices if production_val is None
+                   else ids.long())
             state["changed"] += int((idx.sort(-1).values != base.sort(-1).values).any(1).sum())
-            state["rows"] += idx.shape[0]
+        state["rows"] += idx.shape[0]
+        if arm in ("placement", "production_noop") and parity_tokens > 0:
+            # Quantify native BF16 tie-breaking and weight arithmetic differences,
+            # while the treatment itself always uses the actual production selector.
+            rec = state["parity"].setdefault(order[id(mod)], {
+                "rows": 0, "selection_mismatch_rows": 0,
+                "weight_max_abs_on_matching_selection": 0.0,
+            })
+            count = min(parity_tokens - rec["rows"], len(raw))
+            if count > 0:
+                ref_ids = P.rewrite_torch(raw[:count], base[:count], keep, n_gpus, penalty).long()
+                if production_val is None:
+                    prod_w, prod_ids = _select_on_device(raw[:count], top_k, keep, n_gpus,
+                                                scale=scale, load_penalty=penalty)
+                else:
+                    prod_w, prod_ids = production_val[:count], idx[:count]
+                same = (ref_ids.sort(-1).values == prod_ids.long().sort(-1).values).all(-1)
+                previous_rows = rec["rows"]
+                rec["mean_row_logit_std"] = (
+                    rec.get("mean_row_logit_std", 0.0) * previous_rows
+                    + float(raw[:count].std(-1, unbiased=False).mean().detach()) * count
+                ) / (previous_rows + count)
+                if scale is not None:
+                    rec["per_expert_scale_min"] = float(scale.min().detach())
+                    rec["per_expert_scale_max"] = float(scale.max().detach())
+                rec["rows"] += count
+                rec["selection_mismatch_rows"] += int((~same).sum())
+                if bool(same.any()):
+                    probs = z[:count] if scale is not None else z[:count].float().softmax(-1)
+                    ref_w = probs.gather(1, ref_ids)
+                    if getattr(mod, "norm_topk_prob", True):
+                        ref_w = ref_w / ref_w.sum(-1, keepdim=True)
+                    if scale is not None:
+                        ref_w = ref_w * scale[ref_ids]
+                    ref_w = ref_w.gather(1, ref_ids.argsort(-1))
+                    prod_w = prod_w.gather(1, prod_ids.long().argsort(-1))
+                    error = float((ref_w[same] - prod_w[same]).abs().max().detach())
+                    rec["weight_max_abs_on_matching_selection"] = max(
+                        rec["weight_max_abs_on_matching_selection"], error)
         t = state["trace"]
         if t is not None:
             k = order[id(mod)]
-            if sum(x.shape[0] for x in t.setdefault(k, [])) < trace_tokens:
-                t[k].append(idx[:trace_tokens].to(torch.int16).cpu())
+            left = trace_tokens - sum(x.shape[0] for x in t.setdefault(k, []))
+            if left > 0:
+                t[k].append(idx[:left].to(torch.int16).cpu())
 
+        if mask is None:
+            # Stock must run its native arithmetic, including router tie-breaking.
+            return out
         if not isinstance(out, tuple):
-            return z2.reshape(logits.shape)
-        # The transformers-5 Qwen routers moved the softmax, the top-k and the renormalization
-        # *inside* the router and return the selection, so masking the logits is not enough and
-        # it has to be rebuilt here, in the module's own order. Gathering instead of a second
-        # top-k is exact: softmax is monotone, so it cannot reorder the head.
-        #
-        # The weights come off the **unmasked** logits `z`, not `z2`. That is what the rule
-        # actually says - the intervention changes which experts a token is sent to, and each
-        # one still carries the gate weight the gate itself would have given it - and a real
-        # serving implementation would pick different indices rather than mask anything. It is
-        # also what keeps the no-op arm bit-exact: `softmax(z2)` renormalized over the top-k is
-        # the same number in exact arithmetic, but it reaches it by a different division, and
-        # the last-bit disagreement survives the cast to bf16 often enough to move NLL.
-        # Gemma's router already returns fp32 probabilities in `out[0]`, so there is no softmax
-        # left to apply - and softmax is monotone, so masking, ranking and top-k behave
-        # identically on probabilities and on logits. Its per-expert scale is gathered at the
-        # chosen indices, so it follows the selection rather than being perturbed by the mask.
-        scale = getattr(mod, "per_expert_scale", None)
-        val = (z if scale is not None
-               else torch.nn.functional.softmax(z, dtype=torch.float, dim=-1)).gather(-1, idx)
+            return P.mask_logits(z, mask).reshape(scores.shape)
+        if production_val is not None:
+            return (scores, production_val.to(out[1].dtype).reshape(out[1].shape),
+                    idx.to(out[2].dtype).reshape(out[2].shape))
+        # Selection changes, but weights always come from the original unpenalized
+        # distribution. Preserve the family's native probability and scale arithmetic.
+        probs = z if scale is not None else torch.nn.functional.softmax(z, dtype=torch.float, dim=-1)
+        val = probs.gather(-1, idx)
         if getattr(mod, "norm_topk_prob", True):
-            val /= val.sum(dim=-1, keepdim=True)
+            val = val / val.sum(dim=-1, keepdim=True)
         if scale is not None:
             val = val * scale[idx]
-        return (z2.reshape(logits.shape), val.to(logits.dtype), idx)
+        # The router's full logits/probabilities are still useful for auxiliary outputs;
+        # only the selected weights and ids need replacing in the tuple contract.
+        return (scores, val.to(out[1].dtype).reshape(out[1].shape),
+                idx.to(out[2].dtype).reshape(out[2].shape))
 
-    return state, [g.register_forward_hook(hook) for g in gates]
+    return state, projection_handles + [g.register_forward_hook(hook) for g in gates]
 
 
-def arms_of(top_k: int, keeps) -> list[tuple[str, str, int]]:
-    """`(name, arm, keep)` for every arm, in the order they must run.
+def arms_of(top_k: int, keeps, penalties=None):
+    """Controls then `(name, arm, keep, penalty)` treatment arms.
 
-    The baseline comes first because every other arm is reported as a paired difference from
-    it, and the no-op second because it is the assertion that the hook is inert when the rule
-    asks for nothing.
-
-    `baseline2` repeats the baseline arm verbatim. Nothing about the rule needs it: it is there
-    because the no-op arm's residual has to be compared against something, and "bf16 rounding
-    is small" is an argument rather than a measurement. A repeat pass re-runs the same kernels
-    on the same inputs, so whatever it reports - zero, or the non-determinism of a reduction
-    order - is this instrument's own floor, and the no-op arm is only interesting where it
-    exceeds that floor.
+    Omitting `penalties` preserves the legacy three-field interface for external callers.
+    Explicit penalties form a grid for placement; the random control runs once per keep.
+    Zero-penalty arm names retain the historical `placement_6` spelling.
     """
-    return ([("baseline", "baseline", 0), ("baseline2", "baseline", 0),
-             ("noop", "placement", top_k)]
-            + [(f"placement_{k}", "placement", k) for k in keeps]
-            + [(f"random_{k}", "random", k) for k in keeps])
+    legacy = penalties is None
+    penalties = (0.0,) if legacy else tuple(dict.fromkeys(float(p) for p in penalties))
+    keeps = tuple(dict.fromkeys(int(k) for k in keeps))
+    if any(not 1 <= k < top_k for k in keeps):
+        raise ValueError(f"KEEPS must be between 1 and top_k - 1 ({top_k - 1})")
+    if any(not math.isfinite(p) or p < 0 for p in penalties):
+        raise ValueError("PENS must contain finite, nonnegative penalties")
+    arms = [("baseline", "baseline", 0, 0.0), ("baseline2", "baseline", 0, 0.0),
+            ("noop", "placement", top_k, 0.0)]
+    arms += [(f"placement_{k}" + (f"p{p:g}" if p else ""), "placement", k, p)
+             for k in keeps for p in penalties]
+    arms += [(f"random_{k}", "random", k, 0.0) for k in keeps]
+    return [a[:3] for a in arms] if legacy else arms
