@@ -9,6 +9,25 @@ PLACEMENT_KEEP=6 PLACEMENT_LOAD_PENALTY=1 vllm serve <model> -tp 4 --enable-expe
 
 Unset `PLACEMENT_KEEP` and the plugin patches nothing - that is the arm every number below is divided by. `docker/` builds that image, `helm/` deploys it. The router passes the selection through with one warning wherever its premise fails (grouped top-k, score correction, EPLB replication, no renormalization, `ep_size` of 1 or above 32 - `_unsupported` in `plugin.py` is the whole list), because a rule that silently applied where it does not hold would measure as free and serve garbage.
 
+The current nonzero load penalty shares rank counts across 16-token tiles.
+The original layer tables below use the earlier per-token penalty at lambda=1;
+the completed prefill and split-serving follow-ups use the tile penalty at lambda=8.
+Teacher-forced scores under tile routing require the pseudo-likelihood qualification
+described in the [result notes](results/2026-10-18/README.md).
+
+## Code and experiment guide
+
+- [`src/placement_router/`](src/placement_router/): installed vLLM plugin and production routing kernel.
+- [`experiments/README.md`](experiments/README.md): benchmark, profiling and quality entry points.
+- [`tests/`](tests/): CPU regression tests; run `python -m pytest` after `pip install -e '.[test]'`.
+- [`reproduction/2026-10-18/`](reproduction/2026-10-18/): frozen prefill, split-serving, causal-scoring and stochastic-tail study sources.
+- [`results/2026-10-18/`](results/2026-10-18/): audited result summaries and their interpretation.
+
+The completed follow-up replicated a roughly 6–8% **prefill** throughput gain.
+The matched split-serving experiment did **not** establish an end-to-end gain
+when decode was included. See the [follow-up results](results/2026-10-18/README.md)
+for workload definitions, quality results and uncertainty.
+
 ## What it measures out at
 
 Timed inside a running `vllm serve` with CUDA events around DeepEP's dispatch and around `MoERunner._forward_impl`, prefill forwards at 16384 tokens per step, every arm divided by the base arms of *its own launch*. `keep=8` is the zero-substitution control, `x`n is how many independent launches a cell averages, and the floor is that row's own widest base-against-base spread, halved.
@@ -41,7 +60,7 @@ What reaches the whole layer is set by the *other* half of the collective. Combi
 | Qwen3-30B-A3B  E=128  ep=8  (host B) | 11.17 | 16384 | +/-0.52% | **-0.1%** x8 | **-2.7%** x7 | **+0.4%** x10 | **-6.4%** x6 | **-1.8%** x7 |
 <!-- /moetime -->
 
-`keep=6 load_penalty=1` is the arm to deploy: positive on all five rows (+2.0%, +0.5%, +3.2%, +1.9%, +0.4%), clear of the floor on the four whose floor is under 0.25%, with the ep=8 row inside its own wider 0.52% floor - and `keep=6` costs +0.002 nats on paired NLL, 5-14x less than refilling the same slots at random (`experiments/accuracy.py`).
+`keep=6 load_penalty=1` is the strongest whole-layer setting in this original matrix: positive on all five rows (+2.0%, +0.5%, +3.2%, +1.9%, +0.4%), clear of the floor on the four whose floor is under 0.25%, with the ep=8 row inside its own wider 0.52% floor - and `keep=6` costs +0.002 nats on paired NLL, 5-14x less than refilling the same slots at random (`experiments/accuracy.py`).
 
 ## Reproducing
 

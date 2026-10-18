@@ -1,0 +1,12 @@
+{
+  "count": 64,
+  "prompt_tokens": 4096,
+  "generator": "First64 of frozen prior paper prompts: numpy.random.default_rng(0).integers(1,100000,size=(256,4096)); same as size=(64,4096) prefix",
+  "source_sha256": "6e748df3d632146b84755bb25de06d0fea57a7732816a443ae4c17242160ed1f",
+  "source_path": "runs/paper-reproduction-20261017/remote-capture/archive-captures/20261017T174352Z-059ae38080a4/extracted-20261017T174631Z-752c767d24ad/files/paper-ep4/prompts.json",
+  "sha256": "7660341b6e1419c80a71caec4a4c364c7e44339c6089c7c60d62390d1975f479",
+  "minimum_token_id": 1,
+  "maximum_token_id": 99999,
+  "model_id": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+  "checkpoint_revision": "0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe"
+}

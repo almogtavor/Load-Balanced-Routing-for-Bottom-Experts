@@ -1,0 +1,199 @@
+{
+  "analysis_scope": "Prospective report and acceptance specification, frozen before new comparative held-out effects. No runtime or sampling changes.",
+  "campaign": "par-gap-completion-20261018",
+  "causal": {
+    "arms": [
+      "stock",
+      "keep6p8",
+      "keep4p8"
+    ],
+    "chosen_answer_report": "For every arm/policy/scoring convention report exact n, correct count and accuracy; paired treatment-minus-stock gain/loss/both-correct/both-wrong and changed chosen-answer counts, with item IDs retained.",
+    "fresh_heldout_cells": [
+      [
+        "stock",
+        16384
+      ],
+      [
+        "keep6p8",
+        16384
+      ],
+      [
+        "keep4p8",
+        16384
+      ]
+    ],
+    "fresh_training_cells": [
+      [
+        "stock",
+        16384
+      ],
+      [
+        "keep6p8",
+        16384
+      ],
+      [
+        "keep4p8",
+        16384
+      ],
+      [
+        "stock",
+        1024
+      ],
+      [
+        "keep6p8",
+        1024
+      ],
+      [
+        "keep4p8",
+        1024
+      ]
+    ],
+    "heldout_cells_required": 3,
+    "item_sensitivity_interval": {
+      "bounds": "Nearest-rank empirical2.5th and97.5th percentiles: sorted replicate indices ceil(p*10000)-1",
+      "label": "95% conditional paired-item sensitivity interval",
+      "limitations": "One launch per arm; not launch/host/RNG variance, equivalence or evidence of generalization to all10042 items. Unadjusted descriptive intervals across the declared endpoint family.",
+      "method": "Paired nonparametric item bootstrap with common resampled item indices for all reported contrasts",
+      "replicates": 10000,
+      "rng": "Python random.Random(0), sampling n=256 indices with replacement per replicate in fixed selected-item order"
+    },
+    "policy_caveat": "Serial full-reprefill causal scoring under an arm is distinct from incremental KV reuse and mixed PAR-prefill/native-decode generation.",
+    "primary_accuracy_contrasts": [
+      {
+        "baseline": "stock",
+        "policy": "prefix",
+        "scoring": "norm",
+        "treatment": "keep6p8"
+      },
+      {
+        "baseline": "stock",
+        "policy": "prefix",
+        "scoring": "norm",
+        "treatment": "keep4p8"
+      }
+    ],
+    "report_all_arm_endpoints": [
+      "prefix_raw",
+      "prefix_norm",
+      "teacher_raw",
+      "teacher_norm"
+    ],
+    "requests_each_heldout_arm": {
+      "serial_prefix": 29611,
+      "teacher": 4,
+      "total": 29615
+    },
+    "required_wire_checks": [
+      "Exact prefix input tokens[:j]; target token tokens[j] absent from prompt at its scored position; no target forcing, logit bias or allowed-token constraint.",
+      "The arbitrary target ID appears only in logprob selection; response LP is for that exact ID, not substituted sampled-token LP.",
+      "One request completes before the next is submitted globally; no concurrent later prefix/teacher/future request; retain transport and raw body hashes.",
+      "Full re-prefill per scored position, native prefix caching disabled; same frozen source/model, four physical ranks and48 actual router objects per rank.",
+      "All six training analyses and native contracts close before selected heldout protocol freeze; all three heldout raw analyses close before contrasts."
+    ],
+    "score_effect_report": "For both teacher/prefix and raw/character-normalized score, report treatment-minus-stock and teacher-minus-prefix score shifts. Average the four candidate score changes within each item, then average across256 paired items; units nats (raw) or nats per normalization character. Retain exact candidate scores and predictions.",
+    "secondary_accuracy_contrasts": [
+      {
+        "baseline": "stock",
+        "policy": "prefix",
+        "scoring": "raw",
+        "treatment": "keep6p8"
+      },
+      {
+        "baseline": "stock",
+        "policy": "prefix",
+        "scoring": "raw",
+        "treatment": "keep4p8"
+      }
+    ],
+    "subset": {
+      "candidates": 1024,
+      "fresh_unseen_test_claim": false,
+      "items": 256,
+      "not_full_validation_size": 10042,
+      "selected_requests_sha256": "600b8775d9a604d80f9277b7327c62d7f2a23d745507a16578dc3401da4b5609"
+    },
+    "teacher_prefix_diagnostics": "For every arm including stock and both scoring conventions, report teacher-minus-prefix accuracy and chosen-answer flips plus training future/order/cohort diagnostics. The difference includes future-conditioned input, cohort packing and numerical execution; no attribution solely to future leakage.",
+    "training_cells_required": 6
+  },
+  "complete": true,
+  "created_utc": "2026-10-18T13:58:12.095397+00:00",
+  "hybrid": {
+    "arms": [
+      "stock",
+      "keep6p8",
+      "keep4p8"
+    ],
+    "handoff_checks": [
+      "Same fresh8H200 allocation, native stock-prefill/native-decode actual NIXL baseline, treatment PAR-prefill/native-decode; no monolithic baseline substitution.",
+      "Separate fresh native proofs bind full internal request IDs, positive external allocation, completed native receive, exact native routing and final prompt-row recomputation.",
+      "Clean timed server identity/source/command and raw two-leg JSON/SSE replay; no probe/profiler or routing/RPC ledger inside timed interval.",
+      "Every timed cohort requires off-clock per-engine native NIXL counts/bytes matching256 total transfers and25,769,803,776 bytes (each64 and6,442,450,944) plus zero failures.",
+      "Source-correct native/API cached_tokens exact0 denotes producer prefix-cache hits, not transferred KV coverage.",
+      "All response IDs/transfer parameters/output token IDs/usage, wave ordering and cohort/individual recorded clock formulas rechecked; no summed-kernel inference."
+    ],
+    "hardware_inference": "One fresh eight-H200 host with three paired timing sweeps. Do not pool H100 initial prefill, author repeats, previous partial H200 timing, public monolithic quality, or causal full-reprefill Hella.",
+    "numerics": "Retain monolithic/handoff training differences diagnostically; KV checksum observations do not prove numerical equivalence or absence of timing-dependent visibility effects.",
+    "performance_report": "Reuse frozen paired_hybrid_statistics_v1.py and protocol, SHA-pinned: per-launch arithmetic mean of all3 measured cohort wall times, paired treatment/stock log ratios across3 independent fresh-launch sweeps; geometric mean effect and Student t df2 intervals; throughput is inverse wall-time ratio. Retain all3 ratios and all rounds.",
+    "proof_launches_required": 3,
+    "quality_launches_required": 3,
+    "quality_report": "For all1319 paired items report flexible and strict stock/treatment correct counts, gains/losses and observed percentage-point differences. One fresh server pair per arm; no new confidence interval, numerical equivalence or noninferiority claim.",
+    "quality_workload": {
+      "capped_or_parse_failure_items": "Retain in denominator; exact flexible and strict frozen scorer.",
+      "eos": "natural",
+      "items_each_arm": 1319,
+      "max_output_tokens": 2048,
+      "shots": 8,
+      "split": "test",
+      "task": "gsm8k"
+    },
+    "retained_logical_requests": 13824,
+    "timed_launches_required": 9,
+    "timed_orders": [
+      [
+        "stock",
+        "keep6p8",
+        "keep4p8"
+      ],
+      [
+        "keep6p8",
+        "keep4p8",
+        "stock"
+      ],
+      [
+        "keep4p8",
+        "stock",
+        "keep6p8"
+      ]
+    ],
+    "timed_rounds_per_launch": {
+      "measured": 3,
+      "warmup": 3
+    },
+    "timed_workload": {
+      "concurrency": 64,
+      "forced_output_tokens": 128,
+      "input_tokens": 1024,
+      "prompts": 256,
+      "sequential_waves": 4
+    },
+    "timing_statistics_source_sha256": "5a9b1b5653b9a9c576bedc96a9ed2d3ce461de1b35b2eeb80c138022bfe0906d",
+    "total_retained_rounds": 54
+  },
+  "publication_rules": [
+    "Report all declared arms and endpoints, including null/negative results.",
+    "Do not claim full10042 Hella evaluation or equivalent quality.",
+    "Keep elapsed wall-time, throughput, task accuracy and candidate scoring deltas explicitly labeled.",
+    "A completed raw audit certifies captured evidence within its stated limits; it is not tensor-level proof for every clean timed request."
+  ],
+  "schema": "fresh-gap-final-acceptance-protocol-v1",
+  "shared_acceptance": {
+    "archival": "Every report cites actual fresh plan/raw-audit/whole-archive/source/runtime hashes; no archived predecessor PID looked up in current namespace.",
+    "cleanup": "Exact fresh controller/server PID+start ticks/owned groups close; all required source/native hashes unchanged; failed attempts retained.",
+    "new_complete_matrices_only": true,
+    "old_partials_pooled": false,
+    "outcome_based_filter_or_replacement": false,
+    "performance_quality_gate": "Comparative hybrid effects require all three instrumented proofs, all nine clean timed launches and all three full quality launches closed and raw-audited. No quality threshold or output equality filter.",
+    "raw_policy": "Complete exact frozen request/response/SSE inventory and immutable source/plan/owner/cleanup chain; recompute metrics from archived raw rather than trust stored aggregates. Any missing or invalid required cell makes that campaign effects null.",
+    "scope_boundary_sha256": "fff30918181fc6296a6349e5c8d4bb232a0979625dea826b08e2e41ebc8ef071"
+  }
+}
