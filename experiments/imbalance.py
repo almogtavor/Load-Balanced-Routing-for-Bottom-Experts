@@ -3,19 +3,19 @@
 
 Default vLLM routing decides the forward: `PLACEMENT_KEEP` stays unset, so the plugin patches nothing
 and the engine serves exactly what it would without this file. The probe only *reads* each
-router call's logits and scores every arm on them, so one engine load produces the whole
+router call's logits and scores every setting on them, so one engine load produces the whole
 `(ep, keep, load_penalty, tile)` grid on identical inputs - a paired comparison with no run-to-run
-variance between arms at all.
+variance between settings at all.
 
 The expert-to-rank map is `e * G // E`, arithmetic on the expert id alone, so the grid can
 report for any `ep` on whatever GPU count the engine happens to fit on. At `G` ranks over
 8-GPU nodes the same arithmetic gives the node map, which makes the `G=2` and `G=4` rows the
 inter-node (RDMA) fan-out of a 16- and 32-GPU deployment.
 
-Four numbers per arm:
+Four numbers per setting:
 
 * `vol`  - summed (token, rank) dispatch pairs. What the rule is built to cut.
-* `disp` - dispatch pairs landing on the busiest rank. The all-to-all's tail.
+* `disp` - dispatch pairs sent to the busiest rank. The all-to-all's tail.
 * `work` - expert assignments on the busiest rank, over the mean. Every rank waits for the slowest.
 * `exp`  - assignments on the busiest *expert*, over the mean. Their total is fixed, so this is
   the grouped GEMM's own tail: identical work spread over a longer per-expert block is slower.
@@ -80,7 +80,7 @@ def _decline(why: str) -> None:
 
 
 def _grid(k):
-    """`(ep, keep, load_penalty, tile)` arms. Default vLLM (`keep == k`) once per ep as its baseline."""
+    """`(ep, keep, load_penalty, tile)` settings. Default vLLM (`keep == k`) once per ep as its baseline."""
     for g in EPS:
         yield g, k, 0.0, 1
         for keep, pen, tile in itertools.product(KEEPS, PENS, TILES):
@@ -95,7 +95,7 @@ def probe(logits, topk_ids, k) -> None:
     if _calls >= CALLS:
         return
     # A capture records kernels instead of running them, and every host sync below - the
-    # padding filter, the per-arm reduction - is illegal inside one. vLLM captures its decode
+    # padding filter, the per-setting reduction - is illegal inside one. vLLM captures its decode
     # graphs at startup over dummy inputs, which is not traffic worth measuring anyway.
     if torch.cuda.is_current_stream_capturing():
         return
@@ -149,7 +149,7 @@ def dump() -> None:
     out = {k: (v / _calls).tolist() for k, v in _acc.items()}
     print(f"[imb] calls={_calls} seen={_seen} declined={_declined} tokens per call: "
           f"min {min(_tokens)} median {sorted(_tokens)[len(_tokens) // 2]} max {max(_tokens)}", flush=True)
-    print(f"[imb] {'arm':<22}{'vol ↓':>10}{'busiest rank recv ↓':>22}{'busiest rank work ↓':>22}"
+    print(f"[imb] {'setting':<22}{'vol ↓':>10}{'busiest rank recv ↓':>22}{'busiest rank work ↓':>22}"
           f"{'busiest expert ↓':>19}{'calls lighter ↑':>18}", flush=True)
     for g in EPS:
         if (g, _k0(), 0.0, 1) not in out:
@@ -158,7 +158,7 @@ def dump() -> None:
         for (gg, keep, pen, tile), (vol, dmax, work, xmax, wk, lighter) in out.items():
             if gg != g:
                 continue
-            # Total expert assignments are `rows * top_k` in every arm by construction. If it
+            # Total expert assignments are `rows * top_k` in every setting by construction. If it
             # moved, the rule dropped or duplicated one and every ratio here measures that instead.
             assert abs(wk / base[4] - 1) < 1e-9, f"{(gg, keep, pen, tile)} moved work {wk}"
             name = ("default vLLM" if keep >= _k0() else
@@ -170,7 +170,7 @@ def dump() -> None:
     p = pathlib.Path("runs") / f"imbalance_{TAG}_{rank}.json"
     p.parent.mkdir(exist_ok=True)
     p.write_text(json.dumps({"calls": _calls, "eps": EPS, "tokens": _tokens,
-                             "arms": {f"{g}/{keep}/{pen:g}/{tile}": v for (g, keep, pen, tile), v
+                             "settings": {f"{g}/{keep}/{pen:g}/{tile}": v for (g, keep, pen, tile), v
                                       in out.items()}}, indent=1))
     print(f"[imb] wrote {p}", flush=True)
 

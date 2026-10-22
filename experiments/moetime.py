@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MoE layer time inside a running engine, per arm, bucketed by the forward's token count.
+"""MoE layer time inside a running engine, per setting, bucketed by the forward's token count.
 
 End-to-end tokens/s is the wrong instrument for this rule. The rule moves dispatch bytes, and
 dispatch is a fraction of the MoE layer, which is a fraction of the step: at ep=4 on one host a
@@ -9,7 +9,7 @@ a drop in MoE layer time at a fixed token count is the collective and nothing el
 
 Two CUDA events per MoE forward, recorded on the compute stream and reduced a chunk behind the
 front, so nothing here synchronises on work that has not already finished. Installed in
-every worker by `plugin.register()` via `PLACEMENT_PROBE`, on base arms too - it reads.
+every worker by `plugin.register()` via `PLACEMENT_PROBE`, on base settings too - it reads.
 
 `_split` adds a second and third span inside each forward, around DeepEP's dispatch and
 combine, because the whole-layer clock nets the byte saving against a grouped expert GEMM that
@@ -17,9 +17,9 @@ skews when the allowed expert set narrows. Dispatch is the half the rule acts on
 
 Buckets are powers of two of the forward's token count, because a prefill forward and a decode
 forward are different measurements and the mix between them drifts between launches. Comparing
-arms means comparing the same bucket.
+settings means comparing the same bucket.
 
-Writes `runs/moetime_{TAG}_{ARM}_r{REP}_{rank}.json` every chunk, so a worker killed by a
+Writes `runs/moetime_{TAG}_{SETTING}_r{REP}_{rank}.json` every chunk, so a worker killed by a
 signal - which is how vLLM tears them down - still leaves the measurement behind.
 """
 
@@ -52,13 +52,13 @@ def _flush() -> None:
     _pend = []
     _out.parent.mkdir(exist_ok=True)
     _out.write_text(json.dumps({
-        "arm": os.environ.get("ARM", "base"),
+        "setting": os.environ.get("SETTING", "base"),
         "keep": os.environ.get("PLACEMENT_KEEP"),
         "load_penalty": os.environ.get("PLACEMENT_LOAD_PENALTY"),
         "seen": _seen,
         # bucket -> [median ms per MoE forward, forwards]. Keys are the low edge of a power-of-
-        # two token-count bucket; a bucket present in one arm and not another is not comparable.
-        # Median, like `serve_run.py`'s repeat statistic: an arm's first repeat is cold and a
+        # two token-count bucket; a bucket present in one setting and not another is not comparable.
+        # Median, like `serve_run.py`'s repeat statistic: an setting's first repeat is cold and a
         # mean would carry it into the comparison.
         # "buckets" is the whole layer, kept under its original name so the analysis that
         # already reads it needs no change; "disp"/"comb" are the two halves of the collective.
@@ -87,7 +87,7 @@ def install() -> None:
         # `runs/` would write four copies into the image and none onto the shared volume the
         # analysis reads.
         _out = pathlib.Path(__file__).resolve().parent.parent / "runs" / (
-            f"moetime_{os.environ.get('TAG', 'x')}_{os.environ.get('ARM', 'base')}"
+            f"moetime_{os.environ.get('TAG', 'x')}_{os.environ.get('SETTING', 'base')}"
             # The pid, not a rank env var: every worker process of a DP launch reported rank 0,
             # so four engine cores raced on one file and three measurements were lost.
             f"_r{os.environ.get('REP', '0')}_{os.getpid()}.json")

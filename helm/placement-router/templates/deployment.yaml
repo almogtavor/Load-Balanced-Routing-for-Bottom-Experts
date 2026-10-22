@@ -16,8 +16,9 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --model={{ .Values.model }}
-            - --tensor-parallel-size={{ .Values.gpus }}
+            - --data-parallel-size={{ .Values.gpus }}
             - --enable-expert-parallel
+            - --all2all-backend=deepep_high_throughput
             - --trust-remote-code
 {{- range .Values.extraArgs }}
             - {{ . | quote }}
@@ -27,6 +28,8 @@ spec:
               value: {{ .Values.keep | quote }}
             - name: PLACEMENT_LOAD_PENALTY
               value: {{ .Values.loadPenalty | quote }}
+            - name: PLACEMENT_ANY_RANK
+              value: {{ .Values.anyRank | quote }}
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef: {name: {{ .Values.hfTokenSecret }}, key: HF_TOKEN}

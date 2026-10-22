@@ -12,13 +12,13 @@ The families differ in three ways that each need handling:
   The child is the tempting hook - it puts the whole top-k downstream, so the plain-logits path
   appears to cover it - and it is the wrong one: Gemma's own `softmax -> topk -> /= sum ->
   * per_expert_scale` chain then runs on *masked* scores and reaches the same answer by a
-  different sequence of divisions, which in bf16 left the no-op arm 0.02 nat off the baseline.
+  different sequence of divisions, which in bf16 left the no-op setting 0.02 nat off the baseline.
   So the parent is hooked and its tuple rebuilt here, exactly as the Qwen routers are.
 * **what happens after the projection.** Every family softmaxes, takes top-k and renormalizes
   by the top-k sum. The renormalization is what makes logit masking exact rather than
   approximate: masking changes the softmax denominator, and dividing by the top-k sum divides
   that change straight back out - in exact arithmetic. It cancels to rounding in floating
-  point, so on the families whose softmax is downstream of this hook the no-op arm lands a
+  point, so on the families whose softmax is downstream of this hook the no-op setting puts a
   fraction of a millinat off zero rather than on it; `accuracy.py` bounds that rather than
   demanding a zero it cannot have. Gemma's extra `per_expert_scale` is gathered at the chosen
   indices, so it follows the selection rather than being perturbed by the mask.
@@ -33,8 +33,9 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
 import placement as P
+from placement_router.kernel import rewrite_torch
 
-__all__ = ["arms_of", "install", "load", "routing_cfg", "text_cfg"]
+__all__ = ["settings_of", "install", "load", "routing_cfg", "text_cfg"]
 
 
 def pick(cfg, *names, default: int | None = None) -> int:
@@ -86,7 +87,7 @@ def routers(model, n_experts: int, hidden: int) -> list[torch.nn.Module]:
     """Every MoE layer's router: the module owning the `[E, H]` logit projection.
 
     Matched on weight shape *and* a `gate`/`router` path component. Both filters are
-    load-bearing - the name alone also matches `gate_proj`, whose weight is `[I, H]`, and an
+    essential - the name alone also matches `gate_proj`, whose weight is `[I, H]`, and an
     `[E, H]` matrix alone is only probably unique.
 
     Where the match is a projection held inside a router that does the softmax and the top-k
@@ -108,10 +109,10 @@ def routers(model, n_experts: int, hidden: int) -> list[torch.nn.Module]:
 
 def install(model, n_experts: int, top_k: int, hidden: int, n_gpus: int,
             trace_tokens: int = 0):
-    """Hook every router. Returns `(state, handles)`; mutate `state` to switch arm.
+    """Hook every router. Returns `(state, handles)`; mutate `state` to switch setting.
 
-    `state["arm"]` is one of `baseline` / `placement` / `random` and `state["keep"]` is how many
-    top ranks are chosen by score; `placement` at `keep == top_k` is the no-op arm. `changed`
+    `state["setting"]` is one of `baseline` / `placement` / `random` and `state["keep"]` is how many
+    top ranks are chosen by score; `placement` at `keep == top_k` is the no-op setting. `changed`
     and `rows` accumulate the fired fraction, and `trace`, when a dict, collects up to
     `trace_tokens` of routing per layer for the fan-out count.
     """
@@ -121,7 +122,7 @@ def install(model, n_experts: int, top_k: int, hidden: int, n_gpus: int,
     # Per-device block map: `device_map="auto"` spreads layers over GPUs, so the logits of
     # different layers arrive on different devices.
     gpu_maps: dict[torch.device, torch.Tensor] = {}
-    state: dict = {"arm": "baseline", "keep": 0, "trace": None, "changed": 0, "rows": 0,
+    state: dict = {"setting": "baseline", "keep": 0, "trace": None, "changed": 0, "rows": 0,
                    "n_routers": len(gates)}
     order = {id(g): i for i, g in enumerate(gates)}
 
@@ -129,13 +130,18 @@ def install(model, n_experts: int, top_k: int, hidden: int, n_gpus: int,
         logits = out[0] if isinstance(out, tuple) else out
         z = logits.reshape(-1, logits.shape[-1])
         gpu = gpu_maps.setdefault(z.device, P.gpu_of(n_experts, n_gpus, z.device))
-        arm, keep = state["arm"], state["keep"]
-        if arm == "baseline":
+        setting, keep = state["setting"], state["keep"]
+        if setting == "baseline":
             m = None
-        elif arm == "random":
+        elif setting == "random":
             m = P.random_mask(z, keep, top_k)
-        else:  # placement, and the no-op arm which is placement at keep == top_k
+        else:  # placement, and the no-op setting which is placement at keep == top_k
             m = P.allowed_mask(z, keep, gpu, n_gpus, top_k)
+            if state.get("penalty") and keep < top_k:
+                # The serving rule: the tail's load penalty is counted over the tile, so it is the kernel's
+                # own reference that picks it, and the mask only carries its picks.
+                sel = rewrite_torch(z, z.topk(top_k, -1).indices, keep, n_gpus, state["penalty"])
+                m = torch.zeros_like(m).scatter_(1, sel.long(), True)
         z2 = z if m is None else P.mask_logits(z, m)
 
         idx = z2.topk(top_k, -1).indices
@@ -160,7 +166,7 @@ def install(model, n_experts: int, top_k: int, hidden: int, n_gpus: int,
         # actually says - the intervention changes which experts a token is sent to, and each
         # one still carries the gate weight the gate itself would have given it - and a real
         # serving implementation would pick different indices rather than mask anything. It is
-        # also what keeps the no-op arm bit-exact: `softmax(z2)` renormalized over the top-k is
+        # also what keeps the no-op setting bit-exact: `softmax(z2)` renormalized over the top-k is
         # the same number in exact arithmetic, but it reaches it by a different division, and
         # the last-bit disagreement survives the cast to bf16 often enough to move NLL.
         # Gemma's router already returns fp32 probabilities in `out[0]`, so there is no softmax
@@ -179,18 +185,18 @@ def install(model, n_experts: int, top_k: int, hidden: int, n_gpus: int,
     return state, [g.register_forward_hook(hook) for g in gates]
 
 
-def arms_of(top_k: int, keeps) -> list[tuple[str, str, int]]:
-    """`(name, arm, keep)` for every arm, in the order they must run.
+def settings_of(top_k: int, keeps) -> list[tuple[str, str, int]]:
+    """`(name, setting, keep)` for every setting, in the order they must run.
 
-    The baseline comes first because every other arm is reported as a paired difference from
+    The baseline comes first because every other setting is reported as a paired difference from
     it, and the no-op second because it is the assertion that the hook is inert when the rule
     asks for nothing.
 
-    `baseline2` repeats the baseline arm verbatim. Nothing about the rule needs it: it is there
-    because the no-op arm's residual has to be compared against something, and "bf16 rounding
+    `baseline2` repeats the baseline setting verbatim. Nothing about the rule needs it: it is there
+    because the no-op setting's residual has to be compared against something, and "bf16 rounding
     is small" is an argument rather than a measurement. A repeat pass re-runs the same kernels
     on the same inputs, so whatever it reports - zero, or the non-determinism of a reduction
-    order - is this instrument's own floor, and the no-op arm is only interesting where it
+    order - is this instrument's own floor, and the no-op setting is only interesting where it
     exceeds that floor.
     """
     return ([("baseline", "baseline", 0), ("baseline2", "baseline", 0),

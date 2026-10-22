@@ -2,7 +2,7 @@
 
     PYTHONPATH=experiments python experiments/lbgain.py
 
-Both arms ran in the same launch, so `plain / balanced - 1` cancels the launch-to-launch
+Both settings ran in the same launch, so `plain / balanced - 1` cancels the launch-to-launch
 drift the floor in `moeplot.py` has to absorb. Mean, s.e. and a two-sided one-sample t-test
 over launches; a launch count of one gets no test. Writes `runs/lbgain.md`.
 """
@@ -24,10 +24,10 @@ def gains(phase: str) -> dict:
     os.environ["PHASE"] = phase
     M = importlib.reload(importlib.import_module("moeplot"))
     out = {t: {k: [] for k in KEEPS} for t in M.LABEL}
-    for (tag, _), arms in M.load().items():
+    for (tag, _), settings in M.load().items():
         for k in KEEPS:
-            if tag in out and k in arms and k + "p1" in arms:
-                a, b = arms[k], arms[k + "p1"]
+            if tag in out and k in settings and k + "p1" in settings:
+                a, b = settings[k], settings[k + "p1"]
                 if shared := set(a) & set(b):
                     x = max(shared)
                     out[tag][k].append((a[x] / b[x] - 1) * 100)

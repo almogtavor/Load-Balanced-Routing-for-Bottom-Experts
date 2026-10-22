@@ -5,25 +5,28 @@ image:
 
 model: Qwen/Qwen3-30B-A3B
 
-# How many of the top-k picks are chosen by score. The rest are re-placed onto ranks the head
-# already forces a visit to. Empty string is stock vLLM routing, which is the arm every claim
-# about this chart has to be compared against.
-keep: "6"
+# How many of the top-k picks are chosen by score; the rest are replaced. Empty string is
+# default vLLM routing, which is the setting every claim about this chart has to be compared
+# against.
+keep: "4"
 
-# Charged per expert slot already placed on a substitute's destination rank. 0 is the plain
-# rule, which minimises dispatch volume alone and leaves the busiest rank holding more expert
-# slots than stock routing gives it. 1 fixes that at no cost in volume and is already
-# saturated - see `runs/loadpen.md`.
-loadPenalty: "1"
+# Charged per expert pick a 16-token tile has already placed on a rank. 0 is the plain rule,
+# which minimises dispatch volume alone and leaves the busiest rank holding more expert picks
+# than default routing gives it. 8 is the paper's setting.
+loadPenalty: "8"
 
-# Expert parallelism is the whole point: the rule shrinks the all-to-all, so without
-# `--enable-expert-parallel` there is nothing to shrink. GPUs must equal the EP size, and the
-# model's expert count must divide by it.
+# "1": the tail may come from any rank, picked by the load penalty alone (the paper's main
+# setting). "0": only from ranks the head already visits.
+anyRank: "1"
+
+# Expert parallelism over data-parallel ranks with DeepEP: vLLM 0.31 builds its all-to-all
+# kernels only with data parallelism, and without them there is no dispatch to balance. GPUs
+# is the EP size, and the model's expert count must divide by it.
 gpus: 4
 
 extraArgs: []
 
-hfTokenSecret: llm-d-hf-token
+hfTokenSecret: hf-token
 
 resources:
   limits:

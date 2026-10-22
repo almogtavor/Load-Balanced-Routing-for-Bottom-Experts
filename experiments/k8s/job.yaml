@@ -1,32 +1,22 @@
 # One Job per model, `GPUS` GPUs, one container. Substitute and apply through
 # `launch.sh`, which is the only intended entrypoint.
 #
-# Only the BF16 checkpoints this experiment uses are mounted. `/results` carries the
-# cached token streams in and the `runs/` artefacts out, so the figure can be drawn from a
-# laptop after the jobs have finished.
+# Only the BF16 checkpoints this experiment uses are mounted. `/results` holds a copy of this
+# repository and carries the cached token streams in and the `runs/` artefacts out, so the
+# tables can be built from a laptop after the jobs have finished. The claim and secret names
+# below are placeholders: rename them to your cluster's.
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: placement-${NAME}
-  namespace: llm-d-pic
-  labels: {app: placement-router, owner: almogtavor}
+  labels: {app: placement-router}
 spec:
   backoffLimit: 2
   template:
     metadata:
-      labels: {app: placement-router, owner: almogtavor, job: placement-${NAME}}
+      labels: {app: placement-router, job: placement-${NAME}}
     spec:
       restartPolicy: Never
-      affinity:
-        # Two hosts in this cluster have GPUs that are present but unusable - one reports
-        # CUDA error 802 from the fabric manager, the other fails admission with "GPU is
-        # lost". The scheduler packs deterministically and keeps picking them, so every
-        # retry fails identically; `BAD` is the standing exclusion.
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - {key: kubernetes.io/hostname, operator: NotIn, values: [${BAD}]}
       # Optional `NODE=<hostname>` pin. The packing scheduler is deterministic, so a node whose
       # GPU has fallen off the bus keeps being chosen and every retry fails the same way; the
       # pin is the escape hatch. Empty renders as `{}`, which means "anywhere".
@@ -52,8 +42,8 @@ spec:
         - {name: XDG_CACHE_HOME, value: /tmp/.cache}
         - {name: TRITON_CACHE_DIR, value: /tmp/triton}
         - {name: VLLM_CACHE_ROOT, value: /tmp/vllm}
-        # Non-empty switches run.sh to the vLLM path: one engine per listed arm, in order.
-        - {name: ARMS, value: "${ARMS}"}
+        # Non-empty switches run.sh to the vLLM path: one engine per listed setting, in order.
+        - {name: SETTINGS, value: "${SETTINGS}"}
         - {name: SCRIPT, value: "${SCRIPT}"}
         # load_penalty values the in-engine probe scores each keep at.
         - {name: PENS, value: "${PENS}"}
@@ -84,13 +74,22 @@ spec:
         # many requests were in flight. It is a measurement condition, so it is passed.
         - {name: BATCH_TOK, value: "${BATCH_TOK}"}
         - {name: REPEATS, value: "${REPEATS}"}
+        # Untimed repeats before the timed ones; EPLB needs them to rebalance in a short run.
+        - {name: WARMUP, value: "${WARMUP}"}
+        - {name: EPLB_STEPS, value: "${EPLB_STEPS}"}
+        - {name: EPLB_REDUNDANT, value: "${EPLB_REDUNDANT}"}
+        # evalrun.py's lm-eval tasks, and chat prompts for instruction-tuned checkpoints
+        # (EVAL_CHAT for evalrun.py, CHAT for nllserve.py).
+        - {name: EVAL_TASKS, value: "${EVAL_TASKS}"}
+        - {name: EVAL_CHAT, value: "${EVAL_CHAT}"}
+        - {name: CHAT, value: "${CHAT}"}
         # vLLM profiles memory per DP rank, and rank 0 carries the extra buffers;
         # it then sizes every rank's KV cache from its own reading, so a 0.9 that
         # fits rank 0 can overcommit rank 1 by a few hundred MiB and OOM it.
         - {name: GPU_UTIL, value: "${GPU_UTIL}"}
         # For any Hub pull; an anonymous one is rate-limited.
         - name: HF_TOKEN
-          valueFrom: {secretKeyRef: {name: llm-d-hf-token, key: HF_TOKEN}}
+          valueFrom: {secretKeyRef: {name: hf-token, key: HF_TOKEN}}
         resources:
           limits: {cpu: "32", memory: ${MEM}, nvidia.com/gpu: "${GPUS}"}
           requests: {cpu: "8", memory: ${MEM}, nvidia.com/gpu: "${GPUS}"}
@@ -102,10 +101,9 @@ spec:
         - {mountPath: /results, name: results}
         - {mountPath: /dev/shm, name: dshm}
       volumes:
-      - {name: q30rh-bf16, persistentVolumeClaim: {claimName: model-qwen-qwen3-30b-a3b-instruct-2507-rwx}}
-      - {name: q35-bf16, persistentVolumeClaim: {claimName: model-qwen-qwen35-35b-a3b-bf16-rwx}}
-      - {name: gm-bf16, persistentVolumeClaim: {claimName: model-gemma-4-26b-a4b-it-rwx}}
-      # The claim the `results-rw` pod mounts, which is the one `oc cp` syncs the code to.
-      - {name: results, persistentVolumeClaim: {claimName: kvcache-bench-results-almogtavor}}
+      - {name: q30rh-bf16, persistentVolumeClaim: {claimName: qwen3-30b-a3b-instruct-2507}}
+      - {name: q35-bf16, persistentVolumeClaim: {claimName: qwen3.5-35b-a3b}}
+      - {name: gm-bf16, persistentVolumeClaim: {claimName: gemma-4-26b-a4b-it}}
+      - {name: results, persistentVolumeClaim: {claimName: placement-router-results}}
       # NCCL's intra-node transports need shared memory well beyond the default 64 MB.
       - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}

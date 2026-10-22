@@ -2,11 +2,11 @@
 
     python3 experiments/moeplot.py
 
-Reads `runs/moetime_{tag}_{arm}_r{rep}_{rank}.json` written by `moetime.py` riding along on
-every serve launch. An arm is divided by the base arms of *its own launch*, because an
+Reads `runs/moetime_{tag}_{setting}_r{rep}_{rank}.json` written by `moetime.py` riding along on
+every serve launch. An setting is divided by the base settings of *its own launch*, because an
 unmodified engine loaded twice measured several percent against itself.
 
-The bucket reported is the largest token count both the arm and its baseline recorded - the
+The bucket reported is the largest token count both the setting and its baseline recorded - the
 prefill forward, where the all-to-all is bandwidth-bound and the byte saving can pay. Expert
 GEMM work is conserved by construction (`imbalance.py` asserts it per router call), so at a
 fixed token count the only term left to move is the collective.
@@ -29,14 +29,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 
-def arm_key(a):
+def setting_key(a):
     """`4` is keep=4, `4p0.5` is keep=4 with the load penalty. Descending keep, ascending load_penalty."""
     k, _, al = a.partition("p")
     return -int(k), float(al or 0.0)
 
 
-def arm_label(a: str) -> str:
-    """Axis label for an arm. `8` is the control: the kernel runs and selects nothing different."""
+def setting_label(a: str) -> str:
+    """Axis label for an setting. `8` is the control: the kernel runs and selects nothing different."""
     k, _, pen = a.partition("p")
     if k == "8":
         return "keep=8\n(control: no\nsubstitution)"
@@ -64,7 +64,7 @@ OUT = f"{STEM}.png"
 
 
 def load() -> dict:
-    """`{(tag, rep): {arm: {bucket: median ms per MoE forward, averaged over ranks}}}`."""
+    """`{(tag, rep): {setting: {bucket: median ms per MoE forward, averaged over ranks}}}`."""
     runs: dict = collections.defaultdict(lambda: collections.defaultdict(
         lambda: collections.defaultdict(list)))
     for f in glob.glob("runs/moetime_*.json"):
@@ -76,37 +76,37 @@ def load() -> dict:
         for b, (ms, n) in d.get(KEY, {}).items():
             if n >= 64:   # a bucket seen a handful of times is a transient, not a shape
                 runs[(m.group(1), int(m.group(3)))][m.group(2)][int(b)].append(ms)
-    return {k: {a: {b: st.mean(v) for b, v in bk.items()} for a, bk in arms.items()}
-            for k, arms in runs.items()}
+    return {k: {a: {b: st.mean(v) for b, v in bk.items()} for a, bk in settings.items()}
+            for k, settings in runs.items()}
 
 
 def gains() -> tuple[dict, dict, dict]:
-    """`{tag: {arm: [per-launch %]}}`, the floor per tag, and the stock ms per tag.
+    """`{tag: {setting: [per-launch %]}}`, the floor per tag, and the default ms per tag.
 
     The floor is per tag, not global: a cell in one row is only ever divided by launches of
-    its own tag, so another model's noisiest launch has no bearing on this row's resolution.
+    its own tag, so another model's noisiest launch has no effect on this row's resolution.
     One global `max(spread)/2` let a single wide launch inflate every row at once.
     """
     per = collections.defaultdict(lambda: collections.defaultdict(list))
-    stock = {}
+    default = {}
     spreads = collections.defaultdict(list)
-    for (tag, _rep), arms in load().items():
-        base = {a: bk for a, bk in arms.items() if a.startswith("base")}
+    for (tag, _rep), settings in load().items():
+        base = {a: bk for a, bk in settings.items() if a.startswith("base")}
         if not base or tag not in LABEL:
             continue
-        for a, bk in arms.items():
+        for a, bk in settings.items():
             if a.startswith("base"):
                 continue
-            # The largest forward size this arm and every base arm of this launch both saw.
+            # The largest forward size this setting and every base setting of this launch both saw.
             shared = set(bk) & set.intersection(*(set(v) for v in base.values()))
             if not shared:
                 continue
             b = max(shared)
             bm = st.mean(v[b] for v in base.values())
             per[tag][a].append((bm / bk[b] - 1) * 100)
-            stock[tag] = (bm, b)
-        # The floor is base-against-base, so only a launch that loaded the stock engine twice
-        # contributes to it; a launch with one base arm still yields paired gains above.
+            default[tag] = (bm, b)
+        # The floor is base-against-base, so only a launch that loaded the default engine twice
+        # contributes to it; a launch with one base setting still yields paired gains above.
         bl = [v for v in base.values()]
         shared = set.intersection(*(set(v) for v in bl)) if len(bl) > 1 else set()
         if shared:
@@ -117,33 +117,33 @@ def gains() -> tuple[dict, dict, dict]:
         raise SystemExit("no paired moetime launches yet")
     # A row with no base-against-base launch has no measured resolution, so it is not
     # publishable yet - drop it rather than print a cell nothing bounds. A sweep in flight
-    # hits this for a few minutes, because `base2` is the last arm to load.
+    # hits this for a few minutes, because `base2` is the last setting to load.
     for t in [t for t in per if t not in spreads]:
-        print(f"SKIP {t}: no launch loaded the stock engine twice, floor unmeasured")
+        print(f"SKIP {t}: no launch loaded the default engine twice, floor unmeasured")
         del per[t]
     if not per:
         raise SystemExit("no paired moetime launches with a measured floor yet")
-    return per, {t: max(v) / 2 for t, v in spreads.items() if t in per}, stock
+    return per, {t: max(v) / 2 for t, v in spreads.items() if t in per}, default
 
 
 def main() -> None:
-    per, floor, stock = gains()
+    per, floor, default = gains()
     band = max(floor[t] for t in per)   # one shaded band, so it is the widest row's
-    arms = sorted({a for t in per.values() for a in t}, key=arm_key)
+    settings = sorted({a for t in per.values() for a in t}, key=setting_key)
     tags = [t for t in LABEL if t in per]
     fig, ax = plt.subplots(figsize=(7.6, 4.3))
     w = 0.8 / len(tags)
     for i, t in enumerate(tags):
-        xs = [j + (i - (len(tags) - 1) / 2) * w for j in range(len(arms))]
-        ys = [st.mean(per[t][a]) if per[t][a] else 0.0 for a in arms]
-        er = [st.stdev(per[t][a]) if len(per[t][a]) > 1 else 0.0 for a in arms]
+        xs = [j + (i - (len(tags) - 1) / 2) * w for j in range(len(settings))]
+        ys = [st.mean(per[t][a]) if per[t][a] else 0.0 for a in settings]
+        er = [st.stdev(per[t][a]) if len(per[t][a]) > 1 else 0.0 for a in settings]
         ax.bar(xs, ys, w * 0.92, yerr=er, capsize=3, color=COLOR[t],
-               label=f"{LABEL[t]}  ({stock[t][0]:.2f} ms stock, floor +/-{floor[t]:.2f}%)")
+               label=f"{LABEL[t]}  ({default[t][0]:.2f} ms default, floor +/-{floor[t]:.2f}%)")
     ax.axhspan(-band, band, color="0.82", zorder=0)
     ax.axhline(0, color="black", lw=0.7)
-    ax.set_xticks(range(len(arms)), [arm_label(a) for a in arms])
-    ax.set_ylabel(f"{NAME} faster than stock routing (%)\n" + r"$\uparrow$ higher is better")
-    ax.set_title(f"Placement-aware refill of the bottom experts: {NAME} time in vLLM\n"
+    ax.set_xticks(range(len(settings)), [setting_label(a) for a in settings])
+    ax.set_ylabel(f"{NAME} faster than default routing (%)\n" + r"$\uparrow$ higher is better")
+    ax.set_title(f"Placement-aware replacement of the bottom experts: {NAME} time in vLLM\n"
                  "DeepEP high-throughput all-to-all, prefill forwards, paired within launch",
                  fontsize=10)
     ax.legend(fontsize=8, loc="upper left")
@@ -151,16 +151,16 @@ def main() -> None:
     fig.tight_layout()
     fig.savefig(OUT, dpi=200)
 
-    rows = [f"| model | stock ms / {NAME.lower()} \u2193 | tokens / forward | "
-            "floor | " + " | ".join(arm_label(a).replace("\n", " ") + " \u2191"
-                                    for a in arms) + " |",
-            "|---" * (len(arms) + 4) + "|"]
+    rows = [f"| model | default ms / {NAME.lower()} \u2193 | tokens / forward | "
+            "floor | " + " | ".join(setting_label(a).replace("\n", " ") + " \u2191"
+                                    for a in settings) + " |",
+            "|---" * (len(settings) + 4) + "|"]
     for t in tags:
-        # The launch count rides in the cell, not in one column: arms entered the grid at
-        # different times, so a single per-row count would claim replication an arm measured
+        # The launch count rides in the cell, not in one column: settings entered the grid at
+        # different times, so a single per-row count would claim replication an setting measured
         # once does not have.
-        cells = [f"**{st.mean(v):+.1f}%** x{len(v)}" if (v := per[t][a]) else "-" for a in arms]
-        rows.append(f"| {LABEL[t]} | {stock[t][0]:.2f} | {stock[t][1]} | "
+        cells = [f"**{st.mean(v):+.1f}%** x{len(v)}" if (v := per[t][a]) else "-" for a in settings]
+        rows.append(f"| {LABEL[t]} | {default[t][0]:.2f} | {default[t][1]} | "
                     f"+/-{floor[t]:.2f}% | " + " | ".join(cells) + " |")
     md = "\n".join(rows)
     where = {"moe": "around `MoERunner._forward_impl` - routing, dispatch, expert GEMM, combine",
@@ -171,7 +171,7 @@ def main() -> None:
     open(f"{STEM}.md", "w").write(
         f"{NAME} time inside a running vLLM 0.31 engine on the DeepEP high-throughput "
         f"all-to-all, timed with CUDA events {where}, and reduced to a median per token-count "
-        "bucket. Each arm is divided by the base arms of its own launch; `keep=8` "
+        "bucket. Each setting is divided by the base settings of its own launch; `keep=8` "
         "is the zero-substitution control. Positive is faster, so in every percentage column "
         "higher is better (marked \u2191 in the header; \u2193 marks the one column where lower "
         "is better). The floor is that model's own "

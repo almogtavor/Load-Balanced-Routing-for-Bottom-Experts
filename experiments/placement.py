@@ -17,14 +17,14 @@ The rewrite is expressed as a **mask over the router logits**, not as a rewritte
 Every mask here leaves exactly `top_k` experts allowed - the top `keep`, which are the highest
 logits and are never masked, plus the chosen substitutes - so whichever top-k the family's own
 gate runs has no choice left to make and must return precisely that set. That is what makes
-one hook correct for three incompatible gate contracts, and it is what makes the no-op arm
+one hook correct for three incompatible gate contracts, and it is what makes the no-op setting
 reproduce the baseline's selection token for token: leaving the allowed set wide and letting the
 gate pick the substitutes would be the same rule in expectation, but bf16 logits tie often
-enough that `topk` resolves a masked row differently from an unmasked one, and the no-op arm
+enough that `topk` resolves a masked row differently from an unmasked one, and the no-op setting
 would then be measuring tie-breaks. Order within the selection may still vary on a tie; that is
 harmless, because tied logits carry equal weight. The softmax that weights the selection sees a
 changed denominator, which the top-k renormalization divides back out - exactly in exact
-arithmetic, to rounding in bf16, which is why the no-op arm is checked against the paired
+arithmetic, to rounding in bf16, which is why the no-op setting is checked against the paired
 test's resolution rather than against a literal zero.
 """
 
@@ -55,7 +55,7 @@ def allowed_mask(logits: torch.Tensor, keep: int, gpu: torch.Tensor, n_gpus: int
 
     Exactly `top_k` experts, so the gate cannot deviate from this selection. A GPU block holds
     `E / G >= top_k` experts and at most `keep` of them are head, so there are always enough
-    substitutes to fill the remaining slots.
+    substitutes to fill the remaining picks.
     """
     head = logits.topk(keep, dim=-1).indices                       # [T, keep]
     hot = torch.zeros(logits.shape[0], n_gpus, dtype=torch.bool, device=logits.device)
@@ -71,16 +71,16 @@ def allowed_mask(logits: torch.Tensor, keep: int, gpu: torch.Tensor, n_gpus: int
 
 def random_mask(logits: torch.Tensor, keep: int, top_k: int,
                 generator: torch.Generator | None = None) -> torch.Tensor:
-    """Control arm: the same count of substitutions, chosen with no regard to placement.
+    """Control setting: the same count of substitutions, chosen with no regard to placement.
 
-    Without this arm the experiment cannot tell "the bottom experts do not matter" apart from
-    "placement-aware selection is good". The random arm makes exactly as many substitutions
-    and buys exactly no fan-out, so the accuracy gap between the two arms is the part of the
+    Without this setting the experiment cannot tell "the bottom experts do not matter" apart from
+    "placement-aware selection is good". The random setting makes exactly as many substitutions
+    and buys exactly no fan-out, so the accuracy gap between the two settings is the part of the
     cost that is attributable to *our* choice of replacement rather than to substituting at
     all.
 
     The allowed set is exactly `top_k` experts wide, so the gate's top-k selects all of it and
-    the top-`keep` survive by construction - the same guarantee the placement arm gets from
+    the top-`keep` survive by construction - the same guarantee the placement setting gets from
     masking only below its own head.
     """
     head = logits.topk(keep, dim=-1).indices
@@ -113,12 +113,12 @@ def fanout(idx: torch.Tensor, gpu: torch.Tensor, n_gpus: int) -> torch.Tensor:
 
 
 def _check() -> None:
-    """The rule's three load-bearing properties, against closed-form expectations.
+    """The rule's three essential properties, against closed-form expectations.
 
     Uniform random logits make the fan-out analytic: a GPU holding `E/G` of `E` experts is
     untouched by a top-k drawn *without* replacement with the hypergeometric probability
     `prod_i (E - E/G - i)/(E - i)`, so the baseline expects `G (1 - p(k))` GPUs per token and
-    the placement arm expects `G (1 - p(keep))`. Anything that breaks the masking - a wrong
+    the placement setting expects `G (1 - p(keep))`. Anything that breaks the masking - a wrong
     allowed set, a head that does not survive, an off-by-one in the block map - moves these
     away from the closed form, which an eyeballed index dump would not have caught. The
     with-replacement approximation `((G-1)/G)^k` is 0.03 GPUs off here, which is the size of
@@ -137,7 +137,7 @@ def _check() -> None:
     assert abs(fanout(base, gpu, G).float().mean() - closed_form(K)) < 0.02
 
     # A no-op mask must be the baseline selection itself, not merely a superset of it, or the
-    # gate's own tie-breaking decides the substitutes and the no-op arm drifts off zero.
+    # gate's own tie-breaking decides the substitutes and the no-op setting drifts off zero.
     assert torch.equal(allowed_mask(z, K, gpu, G, K).nonzero()[:, 1].view(-1, K).sort(-1).values,
                        base.sort(-1).values), "no-op mask is not the baseline selection"
     # bf16 ties are common enough at E=128 that this is the case the wide mask got wrong.
@@ -152,7 +152,7 @@ def _check() -> None:
         for name, m in (("placement", allowed_mask(z, keep, gpu, G, K)),
                         ("random", random_mask(z, keep, K))):
             idx = mask_logits(z, m).topk(K, -1).indices
-            # The head must survive in every arm, or the accuracy cost being measured is the
+            # The head must survive in every setting, or the accuracy cost being measured is the
             # cost of discarding good experts rather than of substituting bad ones.
             head = base[:, :keep]
             assert bool((idx.unsqueeze(2) == head.unsqueeze(1)).any(1).all()), name
