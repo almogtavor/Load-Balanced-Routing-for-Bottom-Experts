@@ -1,0 +1,13 @@
+# GPQA-Diamond from an ungated mirror whose questions carry shuffled, lettered choices; scored by
+# the log-likelihood of the answer letter, zero-shot (not lm-eval's gpqa_diamond_zeroshot).
+task: gpqa_diamond_letters
+dataset_path: fingertap/GPQA-Diamond
+test_split: test
+output_type: multiple_choice
+doc_to_text: "{{question}}\nAnswer:"
+doc_to_choice: ["A", "B", "C", "D"]
+doc_to_target: "{{['A', 'B', 'C', 'D'].index(answer)}}"
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true

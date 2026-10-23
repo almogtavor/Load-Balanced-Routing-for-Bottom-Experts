@@ -27,7 +27,7 @@ set -euo pipefail
 : "${GPU_UTIL:=0.90}"
 : "${BATCH_TOK:=0}"   # 0 = serve_run picks max(MAX_LEN, 2048); vLLM's own DP default is 256
 : "${WARMUP:=0}" ; : "${EPLB_STEPS:=100}" ; : "${EPLB_REDUNDANT:=16}"
-: "${EVAL_TASKS:=}" ; : "${EVAL_CHAT:=}" ; : "${CHAT:=}"
+: "${EVAL_TASKS:=}" ; : "${EVAL_CHAT:=}" ; : "${EVAL_GEN_KWARGS:=}" ; : "${MAX_LEN:=}" ; : "${CHAT:=}"
 : "${PENS:=0,1}" ; : "${SETTINGS:=}" ; : "${SCRIPT:=}" ; : "${IMG:=v0.31.0}" ; : "${A2A:=}" ; : "${DP:=2}" ; : "${REPS:=1}" ; : "${REP0:=0}"
 
 for kv in "$@"; do export "${kv?}"; done
@@ -37,9 +37,9 @@ for kv in "$@"; do export "${kv?}"; done
 # `nodeSelector: {${NODE}}`, so the pin is a whole `key: value` pair, not just a hostname.
 NODE="${NODE:+kubernetes.io/hostname: ${NODE}}"
 export NAME TAG MODEL GPUS MEM BATCH NWIN KEEPS STREAM TOKREF NODE PENS SETTINGS SCRIPT IMG A2A DP REPS REP0
-export N_REQ PROMPT_LEN GEN_LEN REPEATS BATCH_TOK GPU_UTIL WARMUP EPLB_STEPS EPLB_REDUNDANT EVAL_TASKS EVAL_CHAT CHAT
+export N_REQ PROMPT_LEN GEN_LEN REPEATS BATCH_TOK GPU_UTIL WARMUP EPLB_STEPS EPLB_REDUNDANT EVAL_TASKS EVAL_CHAT EVAL_GEN_KWARGS MAX_LEN CHAT
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 oc delete job "placement-${NAME}" --ignore-not-found >/dev/null
-envsubst '$NAME $TAG $MODEL $GPUS $MEM $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $PENS $SETTINGS $SCRIPT $IMG $A2A $DP $REPS $REP0 $N_REQ $PROMPT_LEN $GEN_LEN $REPEATS $BATCH_TOK $GPU_UTIL $WARMUP $EPLB_STEPS $EPLB_REDUNDANT $EVAL_TASKS $EVAL_CHAT $CHAT' \
+envsubst '$NAME $TAG $MODEL $GPUS $MEM $BATCH $NWIN $KEEPS $STREAM $TOKREF $NODE $PENS $SETTINGS $SCRIPT $IMG $A2A $DP $REPS $REP0 $N_REQ $PROMPT_LEN $GEN_LEN $REPEATS $BATCH_TOK $GPU_UTIL $WARMUP $EPLB_STEPS $EPLB_REDUNDANT $EVAL_TASKS $EVAL_CHAT $EVAL_GEN_KWARGS $MAX_LEN $CHAT' \
   < "${here}/job.yaml" | oc apply -f -
 echo "launched placement-${NAME}: ${TAG} ${MODEL} gpus=${GPUS} settings=${SETTINGS:-offline} a2a=${A2A:-default} dp=${DP} reps=${REPS} rep0=${REP0} shape=${N_REQ}x${PROMPT_LEN}/${GEN_LEN} btok=${BATCH_TOK}"

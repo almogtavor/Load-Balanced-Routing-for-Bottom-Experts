@@ -82,6 +82,8 @@ spec:
         # (EVAL_CHAT for evalrun.py, CHAT for nllserve.py).
         - {name: EVAL_TASKS, value: "${EVAL_TASKS}"}
         - {name: EVAL_CHAT, value: "${EVAL_CHAT}"}
+        - {name: EVAL_GEN_KWARGS, value: "${EVAL_GEN_KWARGS}"}
+        - {name: MAX_LEN, value: "${MAX_LEN}"}
         - {name: CHAT, value: "${CHAT}"}
         # vLLM profiles memory per DP rank, and rank 0 carries the extra buffers;
         # it then sizes every rank's KV cache from its own reading, so a 0.9 that

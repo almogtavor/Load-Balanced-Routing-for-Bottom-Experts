@@ -108,6 +108,8 @@ python experiments/paired.py accuracy-qwen30b
 
 For Gemma-4 add `EVAL_CHAT=1 EVAL_TASKS=gsm8k`; `EVAL_TASKS` selects lm-eval tasks.
 
+GPQA-Diamond, ARC-Challenge and MATH-500 (appendix table): `EVAL_TASKS=gpqa_diamond_letters,arc_challenge` (the GPQA task is `experiments/tasks/gpqa_diamond_letters.yaml`), and separately `EVAL_TASKS=minerva_math500 EVAL_GEN_KWARGS=max_gen_toks=2048 MAX_LEN=8192`. Gemma-4 takes `EVAL_CHAT=1` for MATH-500 only.
+
 Placement-aware tail accuracy and WikiText NLL (Table 5): the same command with `SCRIPT=experiments/evalrun.py,experiments/nllserve.py` and `SETTINGS=base,base2,keep6-penalty8,keep4-penalty8,keep6-sampled-from-top32,keep4-sampled-from-top32,keep1-mass0.6,keep1-mass0.7`.
 
 In-engine timing (the tables above; check out 2d8f519 first for the per-token penalty):

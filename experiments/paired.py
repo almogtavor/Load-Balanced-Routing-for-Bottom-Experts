@@ -8,7 +8,8 @@ sweep, with a 95% t-interval over sweeps. A launch is the unit because two launc
 engine differ by more than the batches inside one launch do.
 
 Accuracy, from `eval_<tag>_<setting>_r<rep>/`: each question's score averaged over runs (GSM8K
-strict match, HellaSwag length-normalized, MMLU over all subjects), then the mean difference
+strict match, HellaSwag and ARC-Challenge length-normalized, GPQA-Diamond by answer letter, MMLU over all
+subjects, MATH-500 by math-verify), then the mean difference
 against REF in points and its standard error, paired by question.
 """
 
@@ -27,7 +28,8 @@ from collections import defaultdict
 T975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306,
         9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145, 15: 2.131}
 METRIC = {"gsm8k": ("exact_match", "strict-match"), "hellaswag": ("acc_norm", None),
-          "mmlu": ("acc", None)}
+          "mmlu": ("acc", None), "gpqa_diamond_letters": ("acc", None),
+          "arc_challenge": ("acc_norm", None), "minerva_math500": ("math_verify", None)}
 
 
 def interval(logs: list[float]) -> str:

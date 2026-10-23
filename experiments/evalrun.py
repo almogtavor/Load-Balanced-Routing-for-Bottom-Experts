@@ -1,4 +1,4 @@
-"""One setting of the accuracy check: GSM8K, HellaSwag and MMLU through lm-eval, served by the same
+"""One setting of the accuracy check: GSM8K, HellaSwag and MMLU (or EVAL_TASKS) through lm-eval, served by the same
 `vllm serve` (data-parallel, DeepEP) that `serve_run.py` times, the plugin set by `SETTING`.
 
 Per-item samples go to `runs/eval_<tag>_<setting>_r<rep>/`, so settings are compared item by item
@@ -20,6 +20,8 @@ TASKS = os.environ.get("EVAL_TASKS") or "gsm8k,hellaswag,mmlu"
 LIMIT = os.environ.get("EVAL_LIMIT")
 # Gemma-4-26B is instruction-tuned only: plain completions score it at ~44 on GSM8K.
 CHAT = os.environ.get("EVAL_CHAT")
+# MATH-500 needs room to finish its solutions: "max_gen_toks=2048" with MAX_LEN=8192.
+GEN = os.environ.get("EVAL_GEN_KWARGS")
 
 
 def main() -> None:
@@ -32,7 +34,7 @@ def main() -> None:
     if not os.path.exists(py):
         subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", "/tmp/lme"],
                        check=True)
-    subprocess.run([py, "-m", "pip", "install", "-q", "lm-eval[api]"], check=True)
+    subprocess.run([py, "-m", "pip", "install", "-q", "lm-eval[api,math]"], check=True)
     out = S.OUT / f"eval_{S.TAG}_{S.SETTING}_r{S.REP}"
     p = S.serve()
     try:
@@ -41,8 +43,9 @@ def main() -> None:
             "--model_args", f"model={S.MODEL},base_url={S.URL}/v1/completions,num_concurrent=128,"
                             f"max_retries=3,tokenized_requests={bool(CHAT)},tokenizer={S.MODEL},"
                             f"max_length={S.MAX_LEN}",
-            "--tasks", TASKS, "--log_samples", "--output_path", str(out),
-            *(["--limit", LIMIT] if LIMIT else []),
+            "--tasks", TASKS, "--include_path", os.path.join(os.path.dirname(__file__), "tasks"),
+            "--log_samples", "--output_path", str(out),
+            *(["--limit", LIMIT] if LIMIT else []), *(["--gen_kwargs", GEN] if GEN else []),
             *(["--apply_chat_template", "--fewshot_as_multiturn"] if CHAT else [])], check=True)
     finally:
         S.kill(p)
